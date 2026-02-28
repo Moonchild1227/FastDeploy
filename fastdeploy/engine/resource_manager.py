@@ -20,6 +20,7 @@ import time
 
 import numpy as np
 
+from fastdeploy import envs
 from fastdeploy.cache_manager.prefix_cache_manager import PrefixCacheManager
 from fastdeploy.metrics.metrics import main_process_metrics
 from fastdeploy.utils import llm_logger
@@ -59,6 +60,18 @@ class ResourceManager:
         # current batch status of the engine
         self.real_bsz = 0
         self.abort_req_ids_set = set()
+
+        # Head-wise KV cache management
+        self.enable_head_wise_kv_cache = envs.FD_HEAD_WISE_KV_CACHE == 1
+        if self.enable_head_wise_kv_cache:
+            self.kv_num_heads = max(
+                1,
+                int(config.model_config.num_key_value_heads) // config.parallel_config.tensor_parallel_size,
+            )
+            llm_logger.info(
+                f"[HEAD_WISE] ResourceManager initialized with head-wise mode. " f"kv_num_heads={self.kv_num_heads}"
+            )
+
         llm_logger.info(f"{self.info()}")
         main_process_metrics.max_batch_size.set(max_num_seqs)
 
@@ -122,7 +135,7 @@ class ResourceManager:
             required_type (str): required type
 
         Returns:
-            list: block list
+            list: block list (1D block_ids) or 2D cache_ids (head-wise mode)
         """
         if required_type == "all":
             block_num = self.get_required_block_number(input_token_num)
@@ -138,8 +151,17 @@ class ResourceManager:
         if block_num > current_block_num:
             llm_logger.error(f"block_num:{block_num} > free_list len:{current_block_num}")
             return block_list
+
         block_list = self.cache_manager.allocate_gpu_blocks(block_num)
-        llm_logger.debug(f"dispatch {len(block_list)} blocks.")
+
+        if self.enable_head_wise_kv_cache:
+            llm_logger.info(
+                f"[HEAD_WISE] _get_block_tables: allocated {block_num} blocks, "
+                f"cache_ids_2d shape: [{len(block_list)}][{len(block_list[0]) if block_list else 0}]"
+            )
+        else:
+            llm_logger.debug(f"dispatch {len(block_list)} blocks.")
+
         return block_list
 
     def check_and_free_block_tables(self):
@@ -156,7 +178,7 @@ class ResourceManager:
         Recycling memory resource blocks
 
         Args:
-            block_tables (list): block list
+            task: task object containing block_tables or cache_ids_2d
         """
 
         if self.enable_prefix_cache:
@@ -167,11 +189,26 @@ class ResourceManager:
                 block_tables = task
             else:
                 block_tables = task.block_tables
-            ori_number = self.available_block_num()
-            self.cache_manager.recycle_gpu_blocks(block_tables)
-            cur_number = self.available_block_num()
-            main_process_metrics.gpu_cache_usage_perc.set(self.get_gpu_cache_usage_perc())
-            llm_logger.info(f"recycle {req_id} {cur_number - ori_number} blocks.")
+
+            # Handle head-wise mode
+            if self.enable_head_wise_kv_cache and task.is_head_wise:
+                # block_tables is 2D cache_ids
+                cache_ids_2d = block_tables
+                ori_number = self.available_block_num()
+                self.cache_manager.recycle_gpu_blocks(cache_ids_2d, req_id)
+                cur_number = self.available_block_num()
+                main_process_metrics.gpu_cache_usage_perc.set(self.get_gpu_cache_usage_perc())
+                llm_logger.info(
+                    f"[HEAD_WISE] recycle {req_id} {cur_number - ori_number} blocks. "
+                    f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}]"
+                )
+            else:
+                # Original behavior: block_tables is 1D block_ids
+                ori_number = self.available_block_num()
+                self.cache_manager.recycle_gpu_blocks(block_tables, req_id)
+                cur_number = self.available_block_num()
+                main_process_metrics.gpu_cache_usage_perc.set(self.get_gpu_cache_usage_perc())
+                llm_logger.info(f"recycle {req_id} {cur_number - ori_number} blocks.")
 
     def available_batch(self):
         """
@@ -281,10 +318,37 @@ class ResourceManager:
                         continue  # retry
                     else:
                         task.block_tables = block_tables
+
+                    # Mark head-wise mode on task
+                    if self.enable_head_wise_kv_cache:
+                        task.is_head_wise = True
+                        llm_logger.info(
+                            f"[HEAD_WISE] task {task.request_id} marked as head-wise, "
+                            f"block_tables shape: [{len(block_tables)}][{len(block_tables[0]) if block_tables else 0}]"
+                        )
+                    else:
+                        task.is_head_wise = False
+
                     task.need_block_tables = task.block_tables
                     # 2. if prefill/decode disaggregation is enabled
                     if task.disaggregate_info is not None:
-                        task.disaggregate_info["block_tables"] = block_tables
+                        # P2: In head-wise mode, disaggregate paths expect 1D block_ids
+                        # Need to convert 2D cache_ids to 1D block_ids before sending
+                        if self.enable_head_wise_kv_cache and task.is_head_wise:
+                            # Convert 2D cache_ids to 1D block_ids for disaggregate
+                            cache_ids_2d = block_tables
+                            if cache_ids_2d and len(cache_ids_2d) > 0:
+                                block_ids_1d = [cache_id // self.kv_num_heads for cache_id in cache_ids_2d[0]]
+                                task.disaggregate_info["block_tables"] = block_ids_1d
+                                llm_logger.info(
+                                    f"[HEAD_WISE] Converted 2D cache_ids to 1D block_ids for disaggregate. "
+                                    f"request_id={task.request_id}, block_ids[:5]={block_ids_1d[:5]}"
+                                )
+                            else:
+                                task.disaggregate_info["block_tables"] = block_tables
+                        else:
+                            task.disaggregate_info["block_tables"] = block_tables
+
                         if task.disaggregate_info["role"] == "prefill":
                             self.req_dict[task.request_id] = allocated_position
                         elif task.disaggregate_info["role"] == "decode":
@@ -311,7 +375,20 @@ class ResourceManager:
                 break
 
         # record batch size here
-        num_blocks_used_by_tasks = sum([len(task.block_tables) if task else 0 for task in self.tasks_list])
+        if self.enable_head_wise_kv_cache:
+            # In head-wise mode, block_tables is 2D, count actual blocks
+            num_blocks_used_by_tasks = 0
+            for task in self.tasks_list:
+                if task and task.block_tables:
+                    # block_tables is 2D: [kv_num_heads][num_blocks]
+                    # count the number of blocks (second dimension)
+                    if task.is_head_wise and len(task.block_tables) > 0:
+                        num_blocks_used_by_tasks += len(task.block_tables[0])
+                    else:
+                        num_blocks_used_by_tasks += len(task.block_tables)
+        else:
+            num_blocks_used_by_tasks = sum([len(task.block_tables) if task else 0 for task in self.tasks_list])
+
         main_process_metrics.available_gpu_block_num.set(self.total_block_number() - num_blocks_used_by_tasks)
         main_process_metrics.batch_size.set(self.max_num_seqs - self.available_batch())
         main_process_metrics.gpu_cache_usage_perc.set(self.get_gpu_cache_usage_perc())

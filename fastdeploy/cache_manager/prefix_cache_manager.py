@@ -77,7 +77,34 @@ class PrefixCacheManager:
             self.num_gpu_blocks = self.cache_config.prefill_kvcache_block_num
         self.num_cpu_blocks = self.cache_config.num_cpu_blocks
 
-        self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
+        # Head-wise KV cache management
+        self.enable_head_wise_kv_cache = envs.FD_HEAD_WISE_KV_CACHE == 1
+        self.kv_num_heads = max(
+            1,
+            int(config.model_config.num_key_value_heads) // config.parallel_config.tensor_parallel_size,
+        )
+
+        # P1: Head-wise mode currently only supports v0 scheduler path
+        if self.enable_head_wise_kv_cache and envs.ENABLE_V1_KVCACHE_SCHEDULER:
+            logger.warning(
+                "[HEAD_WISE] Head-wise KV cache mode is enabled but v1 scheduler is also enabled. "
+                "Head-wise mode currently only supports v0 scheduler path. "
+                "Please set ENABLE_V1_KVCACHE_SCHEDULER=0 when using FD_HEAD_WISE_KV_CACHE=1"
+            )
+
+        if self.enable_head_wise_kv_cache:
+            # Head-wise mode: free_list maintains cache_id (0 ~ num_blocks * kv_num_heads - 1)
+            # cache_id = block_id * kv_num_heads + head_id
+            self.total_cache_ids = self.num_gpu_blocks * self.kv_num_heads
+            self.gpu_free_block_list = list(range(self.total_cache_ids - 1, -1, -1))
+            logger.info(
+                f"[HEAD_WISE] PrefixCacheManager initialized with head-wise mode. "
+                f"num_gpu_blocks={self.num_gpu_blocks}, kv_num_heads={self.kv_num_heads}, "
+                f"total_cache_ids={self.total_cache_ids}"
+            )
+        else:
+            self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
+
         if self.num_cpu_blocks > 0:
             self.cpu_free_block_list = list(range(self.num_cpu_blocks - 1, -1, -1))
         else:
@@ -167,6 +194,11 @@ class PrefixCacheManager:
 
     @property
     def available_gpu_resource(self):
+        if self.enable_head_wise_kv_cache:
+            # In head-wise mode, free_list contains cache_ids
+            # Need to convert to block count for meaningful resource ratio
+            free_block_count = len(self.gpu_free_block_list) // self.kv_num_heads
+            return free_block_count / self.num_gpu_blocks if self.num_gpu_blocks > 0 else 0.0
         return len(self.gpu_free_block_list) / self.num_gpu_blocks if self.num_gpu_blocks > 0 else 0.0
 
     def launch_cache_manager(
@@ -427,31 +459,49 @@ class PrefixCacheManager:
         self.cache_config = cache_config
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
             self.num_gpu_blocks = cache_config.total_block_num
-            self.gpu_free_block_list = list(
-                range(self.num_gpu_blocks - 1, -1, -1)
-            )  # All gpu blocks are managed by cache manager
         else:
             self.num_gpu_blocks = cache_config.prefill_kvcache_block_num
-            self.gpu_free_block_list = list(
-                range(self.num_gpu_blocks - 1, -1, -1)
-            )  # Only block table divided for prefill managed by server
+
+        # In head-wise mode, free_list should be cache_ids
+        if self.enable_head_wise_kv_cache:
+            self.total_cache_ids = self.num_gpu_blocks * self.kv_num_heads
+            self.gpu_free_block_list = list(range(self.total_cache_ids - 1, -1, -1))
+            logger.info(
+                f"[HEAD_WISE] update_cache_config: reset free_list to cache_ids, "
+                f"total_cache_ids={self.total_cache_ids}"
+            )
+        else:
+            self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
 
         heapq.heapify(self.gpu_free_block_list)
         self.node_id_pool = list(range(self.num_gpu_blocks + self.num_cpu_blocks))
 
         main_process_metrics.max_gpu_block_num.set(self.num_gpu_blocks)
         main_process_metrics.available_gpu_block_num.set(self.num_gpu_blocks)
-        main_process_metrics.free_gpu_block_num.set(self.num_gpu_blocks)
+        # In head-wise mode, report block count not cache_id count
+        free_block_count = len(self.gpu_free_block_list)
+        if self.enable_head_wise_kv_cache:
+            free_block_count = free_block_count // self.kv_num_heads
+        main_process_metrics.free_gpu_block_num.set(free_block_count)
         main_process_metrics.available_gpu_resource.set(1.0)
 
     def can_allocate_gpu_blocks(self, num_blocks: int):
         """
         Check if num_blocks gpu blocks can be allocated.
         """
-        if len(self.gpu_free_block_list) < num_blocks:
+        # In head-wise mode, check at block level
+        available_blocks = len(self.gpu_free_block_list)
+        if self.enable_head_wise_kv_cache:
+            available_blocks = available_blocks // self.kv_num_heads
+
+        if available_blocks < num_blocks:
             if self.cache_config.enable_prefix_caching:
                 self.free_block_ids(num_blocks)
-            if len(self.gpu_free_block_list) < num_blocks:
+            # Re-check after freeing
+            available_blocks = len(self.gpu_free_block_list)
+            if self.enable_head_wise_kv_cache:
+                available_blocks = available_blocks // self.kv_num_heads
+            if available_blocks < num_blocks:
                 return False
             else:
                 return True
@@ -461,12 +511,21 @@ class PrefixCacheManager:
     def allocate_gpu_blocks(self, num_blocks, req_id=None):
         """
         allocate gpu blocks.
+
+        When head-wise mode is enabled:
+        - Returns 2D cache_ids: List[List[int]] where cache_ids[head_id][block_idx] = cache_id
+        - cache_id = block_id * kv_num_heads + head_id
+        - All heads of the same block are allocated together to ensure kernel compatibility
         """
+        if self.enable_head_wise_kv_cache:
+            return self._allocate_gpu_blocks_head_wise(num_blocks, req_id)
+
+        # Original behavior: return 1D block_ids
         assert num_blocks <= len(
             self.gpu_free_block_list
         ), f"gpu free block num: {len(self.gpu_free_block_list)} < needed number {num_blocks}"
         logger.debug(f"{req_id} start allocate...")
-        allocated_block_ids = [heapq.heappop(self.gpu_free_block_list) for i in range(num_blocks)]
+        allocated_block_ids = [heapq.heappop(self.gpu_free_block_list) for _ in range(num_blocks)]
         logger.info(
             f"req_id:{req_id} allocate_gpu_blocks: {allocated_block_ids}, len(self.gpu_free_block_list) {len(self.gpu_free_block_list)}"
         )
@@ -474,10 +533,95 @@ class PrefixCacheManager:
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
         return allocated_block_ids
 
+    def _allocate_gpu_blocks_head_wise(self, num_blocks, req_id=None):
+        """
+        Allocate GPU blocks in head-wise mode.
+
+        Key constraint: All heads of the same logical block must be allocated together.
+        This ensures that kernel can access cache[block_id, head_id] correctly.
+
+        Strategy: Maintain a block-level view for allocation, then expand to cache_id view.
+        This avoids fragmentation and ensures atomic allocation of all heads per block.
+
+        Returns:
+            List[List[int]]: 2D cache_ids with shape [kv_num_heads][num_blocks]
+            cache_ids[head_id][block_idx] = block_id * kv_num_heads + head_id
+        """
+        # Check availability at block level
+        available_blocks = len(self.gpu_free_block_list) // self.kv_num_heads
+        if num_blocks > available_blocks:
+            raise AssertionError(f"[HEAD_WISE] gpu free block num: {available_blocks} < needed number {num_blocks}")
+
+        logger.info(f"[HEAD_WISE] req_id:{req_id} allocating {num_blocks} blocks (available: {available_blocks})")
+
+        # Step 1: Collect unique block_ids by popping cache_ids
+        # We need to ensure we get complete blocks (all heads)
+        allocated_block_ids = set()
+        temp_cache_ids = []  # Temporarily hold popped cache_ids
+
+        while len(allocated_block_ids) < num_blocks:
+            if not self.gpu_free_block_list:
+                # Should not happen due to earlier check, but safeguard
+                break
+
+            cache_id = heapq.heappop(self.gpu_free_block_list)
+            temp_cache_ids.append(cache_id)
+            block_id = cache_id // self.kv_num_heads
+
+            if block_id not in allocated_block_ids:
+                allocated_block_ids.add(block_id)
+
+        # Step 2: For each allocated block_id, ensure ALL its cache_ids are collected
+        # Remove any partial cache_ids from temp_cache_ids that belong to blocks we're not using
+        final_block_ids = sorted(list(allocated_block_ids))[:num_blocks]
+        final_block_ids_set = set(final_block_ids)
+
+        # Return unused cache_ids back to free_list
+        for cache_id in temp_cache_ids:
+            block_id = cache_id // self.kv_num_heads
+            if block_id not in final_block_ids_set:
+                heapq.heappush(self.gpu_free_block_list, cache_id)
+
+        # Step 3: For final blocks, collect any missing cache_ids from free_list
+        for block_id in final_block_ids:
+            for head_id in range(self.kv_num_heads):
+                cache_id = block_id * self.kv_num_heads + head_id
+                if cache_id not in temp_cache_ids:
+                    # This cache_id should be in free_list, find and remove it
+                    if cache_id in self.gpu_free_block_list:
+                        self.gpu_free_block_list.remove(cache_id)
+                        heapq.heapify(self.gpu_free_block_list)
+
+        # Step 4: Build 2D cache_ids array: [head_id][block_idx]
+        cache_ids_2d = []
+        for head_id in range(self.kv_num_heads):
+            head_cache_ids = [block_id * self.kv_num_heads + head_id for block_id in final_block_ids]
+            cache_ids_2d.append(head_cache_ids)
+
+        logger.info(
+            f"[HEAD_WISE] req_id:{req_id} allocated block_ids: {final_block_ids}, "
+            f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}], "
+            f"remaining free cache_ids: {len(self.gpu_free_block_list)}, "
+            f"remaining blocks: {len(self.gpu_free_block_list) // self.kv_num_heads}"
+        )
+
+        main_process_metrics.free_gpu_block_num.set(len(self.gpu_free_block_list) // self.kv_num_heads)
+        main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
+
+        return cache_ids_2d
+
     def recycle_gpu_blocks(self, gpu_block_ids, req_id=None):
         """
         recycle gpu blocks.
+
+        When head-wise mode is enabled:
+        - Accepts 2D cache_ids: List[List[int]]
+        - All cache_ids are pushed back to free_list
         """
+        if self.enable_head_wise_kv_cache:
+            return self._recycle_gpu_blocks_head_wise(gpu_block_ids, req_id)
+
+        # Original behavior: accept 1D block_ids
         logger.info(
             f"req_id:{req_id} recycle_gpu_blocks: {gpu_block_ids}, len(self.gpu_free_block_list) {len(self.gpu_free_block_list)}"
         )
@@ -488,6 +632,35 @@ class PrefixCacheManager:
             heapq.heappush(self.gpu_free_block_list, gpu_block_ids)
         logger.debug(f"req_id:{req_id} recycle blocks end")
         main_process_metrics.free_gpu_block_num.set(len(self.gpu_free_block_list))
+        main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
+
+    def _recycle_gpu_blocks_head_wise(self, cache_ids_2d, req_id=None):
+        """
+        Recycle GPU blocks in head-wise mode.
+
+        Args:
+            cache_ids_2d: List[List[int]] with shape [kv_num_heads][num_blocks]
+        """
+        logger.info(
+            f"[HEAD_WISE] req_id:{req_id} recycle_gpu_blocks_head_wise: "
+            f"shape=[{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}], "
+            f"len(self.gpu_free_block_list) before: {len(self.gpu_free_block_list)}"
+        )
+
+        recycled_count = 0
+        for head_cache_ids in cache_ids_2d:
+            for cache_id in head_cache_ids:
+                heapq.heappush(self.gpu_free_block_list, cache_id)
+                recycled_count += 1
+
+        logger.info(
+            f"[HEAD_WISE] req_id:{req_id} recycled {recycled_count} cache_ids, "
+            f"len(self.gpu_free_block_list) after: {len(self.gpu_free_block_list)}"
+        )
+
+        # Report block count, not cache_id count
+        free_block_count = len(self.gpu_free_block_list) // self.kv_num_heads
+        main_process_metrics.free_gpu_block_num.set(free_block_count)
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
 
     def allocate_cpu_blocks(self, num_blocks):
@@ -554,7 +727,12 @@ class PrefixCacheManager:
         """
         check enough gpu memory to allocate cache
         """
-        if expected_block_num - match_gpu_blocks_num > len(self.gpu_free_block_list):
+        # In head-wise mode, check at block level
+        available_blocks = len(self.gpu_free_block_list)
+        if self.enable_head_wise_kv_cache:
+            available_blocks = available_blocks // self.kv_num_heads
+
+        if expected_block_num - match_gpu_blocks_num > available_blocks:
             msg = (
                 f"request_block_ids: request block for req_id {req_id} failed. "
                 + f"matched gpu block num: {match_gpu_blocks_num} require extra gpu block num: "

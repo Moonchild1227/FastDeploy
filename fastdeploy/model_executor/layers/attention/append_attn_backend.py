@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+from fastdeploy import envs
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.layers.attention.attention import Attention
 from fastdeploy.model_executor.layers.attention.base_attention_backend import (
@@ -44,6 +45,9 @@ from fastdeploy.model_executor.layers.attention.base_attention_backend import (
 )
 from fastdeploy.model_executor.layers.attention.utils import init_rank_and_device_id
 from fastdeploy.platforms import current_platform
+from fastdeploy.utils import get_logger
+
+logger = get_logger("append_attn_backend", "append_attn_backend.log")
 
 
 @dataclass
@@ -183,6 +187,14 @@ class AppendAttentionBackend(AttentionBackend):
             )
         self.fd_config = fd_config
 
+        # Head-wise KV cache management
+        self.enable_head_wise_kv_cache = envs.FD_HEAD_WISE_KV_CACHE == 1
+        if self.enable_head_wise_kv_cache:
+            logger.info(
+                f"[HEAD_WISE] AppendAttentionBackend initialized with head-wise KV cache. "
+                f"kv_num_heads={self.kv_num_heads}, block_size={self.block_size}, head_dim={self.head_dim}"
+            )
+
     def init_attention_metadata(self, forward_meta: ForwardMeta):
         """Initialize attntion metadata hence all layers in the forward pass can reuse it."""
         metadata = AppendAttentionMetadata()
@@ -249,9 +261,28 @@ class AppendAttentionBackend(AttentionBackend):
         kv_cache_quant_type: str = None,
     ):
         """
-        Calculate kv cache shape
+        Calculate kv cache shape.
+
+        When head-wise KV cache is enabled (FD_HEAD_WISE_KV_CACHE=1):
+        - Returns shape [max_num_blocks * kv_num_heads, block_size, head_dim]
+        - This is a reshape view of the original [block, head, token, dim] layout
+        - Physical memory layout is unchanged, just viewed differently
+
+        When disabled (default):
+        - Returns shape [max_num_blocks, kv_num_heads, block_size, head_dim]
         """
-        key_cache_shape = [max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim]
+        if self.enable_head_wise_kv_cache:
+            # Head-wise view: [block * head, token, dim]
+            # This is a reshape view - no physical memory change
+            key_cache_shape = [max_num_blocks * self.kv_num_heads, self.block_size, self.head_dim]
+            logger.info(
+                f"[HEAD_WISE] get_kv_cache_shape: head-wise mode enabled. "
+                f"Shape: {key_cache_shape} (original would be [{max_num_blocks}, {self.kv_num_heads}, {self.block_size}, {self.head_dim}])"
+            )
+        else:
+            # Original: [block, head, token, dim]
+            key_cache_shape = [max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim]
+
         if kv_cache_quant_type is not None and kv_cache_quant_type == "int4_zp":
             key_cache_shape[-1] = self.head_dim // 2
         value_cache_shape = key_cache_shape
@@ -307,6 +338,24 @@ class AppendAttentionBackend(AttentionBackend):
             cache_v = forward_meta.caches[2 * layer.layer_id + 1]
             cache_k_scales = getattr(layer, "cache_k_scale", None)
             cache_v_scales = getattr(layer, "cache_v_scale", None)
+
+        # Head-wise KV cache: reshape from [block*head, token, dim] to [block, head, token, dim] for kernel
+        # This is a view reshape, no memory copy
+        if self.enable_head_wise_kv_cache:
+            original_shape = cache_k.shape
+            max_num_blocks = original_shape[0] // self.kv_num_heads
+            # Use actual last dimension from cache tensor to handle quantization (e.g., int4_zp has head_dim // 2)
+            actual_head_dim = original_shape[-1]
+            target_shape = [max_num_blocks, self.kv_num_heads, self.block_size, actual_head_dim]
+
+            cache_k = cache_k.reshape(target_shape)
+            cache_v = cache_v.reshape(target_shape)
+
+            if layer.layer_id == 0:
+                logger.info(
+                    f"[HEAD_WISE] forward_mixed: reshape cache from {original_shape} to {target_shape} for kernel "
+                    f"(actual_head_dim={actual_head_dim}, self.head_dim={self.head_dim})"
+                )
 
         if layer.layer_id == 0:
             # print(forward_meta.seq_lens_this_time)

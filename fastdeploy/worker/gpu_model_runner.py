@@ -142,6 +142,17 @@ class GPUModelRunner(ModelRunnerBase):
         self.cache_kvs_map: dict = {}
         self.exist_prefill_flag = False
 
+        # Head-wise KV cache management
+        self.enable_head_wise_kv_cache = envs.FD_HEAD_WISE_KV_CACHE == 1
+        if self.enable_head_wise_kv_cache:
+            self.kv_num_heads = max(
+                1,
+                int(self.model_config.num_key_value_heads) // self.parallel_config.tensor_parallel_size,
+            )
+            logger.info(
+                f"[HEAD_WISE] GPUModelRunner initialized with head-wise mode. " f"kv_num_heads={self.kv_num_heads}"
+            )
+
         # VL model config:
         if self.enable_mm:
             if "ernie" in self.fd_config.model_config.model_type:
@@ -249,6 +260,54 @@ class GPUModelRunner(ModelRunnerBase):
             suffix=self.parallel_config.local_engine_worker_queue_port,
             create=False,
         )
+
+    def _get_block_tables_for_kernel(self, request: Request) -> list:
+        """
+        Get block_tables for kernel execution.
+
+        In head-wise mode:
+        - request.block_tables is 2D cache_ids: [kv_num_heads][num_blocks]
+        - We need to convert to 1D block_ids for kernel
+        - Mapping: block_id = cache_id // kv_num_heads
+
+        In normal mode:
+        - request.block_tables is already 1D block_ids
+
+        Returns:
+            list: 1D block_ids for kernel
+        """
+        if self.enable_head_wise_kv_cache and request.is_head_wise:
+            # Convert 2D cache_ids to 1D block_ids
+            cache_ids_2d = request.block_tables
+            if cache_ids_2d and len(cache_ids_2d) > 0 and len(cache_ids_2d[0]) > 0:
+                # All heads share the same block_ids, take from first head
+                # cache_id = block_id * kv_num_heads + head_id
+                # So: block_id = cache_id // kv_num_heads
+                block_ids = [cache_id // self.kv_num_heads for cache_id in cache_ids_2d[0]]
+
+                # P2: Validate consistency across all heads
+                for head_id in range(1, len(cache_ids_2d)):
+                    for block_idx, cache_id in enumerate(cache_ids_2d[head_id]):
+                        expected_block_id = block_ids[block_idx]
+                        actual_block_id = cache_id // self.kv_num_heads
+                        if actual_block_id != expected_block_id:
+                            logger.error(
+                                f"[HEAD_WISE] CRITICAL: block_id mismatch at head {head_id}, block_idx {block_idx}. "
+                                f"Expected block_id {expected_block_id}, got {actual_block_id}. "
+                                f"This indicates corrupted block_tables for request {request.request_id}"
+                            )
+                            raise ValueError("[HEAD_WISE] block_id mismatch: all heads should have the same block_ids")
+
+                logger.debug(
+                    f"[HEAD_WISE] request {request.request_id}: "
+                    f"converted cache_ids_2d[0][:5]={cache_ids_2d[0][:5]} to block_ids[:5]={block_ids[:5]}"
+                )
+                return block_ids
+            else:
+                return []
+        else:
+            # Normal mode: return as-is
+            return request.block_tables
 
     def _async_output_busy_loop(self):
         """Entrypoint for the thread which handles outputs asynchronously."""
@@ -717,11 +776,13 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(
                     input_ids[prefill_start_index:prefill_end_index]
                 )
-                encoder_block_num = len(request.block_tables)
+                # Get block_tables for kernel (handle head-wise mode)
+                block_tables_for_kernel = self._get_block_tables_for_kernel(request)
+                encoder_block_num = len(block_tables_for_kernel)
                 self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
                 self.share_inputs["block_tables"][idx : idx + 1, :] = -1
                 self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                    request.block_tables, dtype="int32"
+                    block_tables_for_kernel, dtype="int32"
                 )
                 self.share_inputs["stop_flags"][idx : idx + 1] = False
                 self.share_inputs["seq_lens_decoder"][idx : idx + 1] = prefill_start_index
@@ -754,11 +815,13 @@ class GPUModelRunner(ModelRunnerBase):
                     self.exist_prefill_flag = False
             elif request.task_type.value == RequestType.DECODE.value:  # decode task
                 logger.debug(f"Handle decode request {request} at idx {idx}")
-                encoder_block_num = len(request.block_tables)
+                # Get block_tables for kernel (handle head-wise mode)
+                block_tables_for_kernel = self._get_block_tables_for_kernel(request)
+                encoder_block_num = len(block_tables_for_kernel)
                 self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
                 self.share_inputs["block_tables"][idx : idx + 1, :] = -1
                 self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                    request.block_tables, dtype="int32"
+                    block_tables_for_kernel, dtype="int32"
                 )
                 if self.share_inputs["is_block_step"][idx]:  # has tasks to continue to decode
                     has_decode_task = True
@@ -1027,11 +1090,13 @@ class GPUModelRunner(ModelRunnerBase):
 
             if request.get("seed") is not None:
                 self.share_inputs["infer_seed"][idx : idx + 1] = request.get("seed")
-            encoder_block_num = len(request.get("block_tables"))
+            # Get block_tables for kernel (handle head-wise mode)
+            block_tables_for_kernel = self._get_block_tables_for_kernel(request)
+            encoder_block_num = len(block_tables_for_kernel)
             self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
             self.share_inputs["block_tables"][idx : idx + 1, :] = -1
             self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                request.block_tables, dtype="int32"
+                block_tables_for_kernel, dtype="int32"
             )
 
             if request.get("bad_words_token_ids") is not None and len(request.get("bad_words_token_ids")) > 0:

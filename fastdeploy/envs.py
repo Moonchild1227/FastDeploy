@@ -50,6 +50,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set attention backend. "NATIVE_ATTN", "APPEND_ATTN"
     # and "MLA_ATTN" can be set currently.
     "FD_ATTENTION_BACKEND": lambda: os.getenv("FD_ATTENTION_BACKEND", "APPEND_ATTN"),
+    # Enable head-wise KV cache management.
+    # When enabled, cache allocation/tracking is done per-head (cache_id = block_id * kv_num_heads + head_id).
+    # The physical tensor layout is reshaped to [block * head, token, dim] as a view.
+    # Kernel behavior remains unchanged (still uses block_id).
+    "FD_HEAD_WISE_KV_CACHE": lambda: int(os.getenv("FD_HEAD_WISE_KV_CACHE", "0")),
     # Set sampling class. "base", "base_non_truncated", "air" and "rejection" can be set currently.
     "FD_SAMPLING_CLASS": lambda: os.getenv("FD_SAMPLING_CLASS", "base"),
     # Set moe backend."cutlass","marlin" and "triton" can be set currently.

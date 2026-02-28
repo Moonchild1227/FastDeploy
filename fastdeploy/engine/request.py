@@ -170,6 +170,7 @@ class Request:
 
         # token num
         self.block_tables = []
+        self.is_head_wise = False  # Flag for head-wise KV cache mode
         self.output_token_ids = []
         self.num_computed_tokens = num_computed_tokens
         self.prefill_start_index = prefill_start_index
