@@ -100,7 +100,10 @@ class PrefixCacheManager:
             logger.info(
                 f"[HEAD_WISE] PrefixCacheManager initialized with head-wise mode. "
                 f"num_gpu_blocks={self.num_gpu_blocks}, kv_num_heads={self.kv_num_heads}, "
-                f"total_cache_ids={self.total_cache_ids}"
+                f"total_cache_ids={self.total_cache_ids}, "
+                f"cache_config.total_block_num={self.cache_config.total_block_num}, "
+                f"cache_config.prefill_kvcache_block_num={self.cache_config.prefill_kvcache_block_num}, "
+                f"cache_config.kv_cache_ratio={getattr(self.cache_config, 'kv_cache_ratio', 'N/A')}"
             )
         else:
             self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
@@ -456,22 +459,40 @@ class PrefixCacheManager:
         """
         update cache config
         """
+        # Log before update for debugging
+        old_num_gpu_blocks = self.num_gpu_blocks
+        old_total_cache_ids = getattr(self, 'total_cache_ids', None)
+
         self.cache_config = cache_config
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
             self.num_gpu_blocks = cache_config.total_block_num
+            logger.info(
+                f"[HEAD_WISE] update_cache_config: using total_block_num={cache_config.total_block_num} "
+                f"(ENABLE_V1_KVCACHE_SCHEDULER=1)"
+            )
         else:
             self.num_gpu_blocks = cache_config.prefill_kvcache_block_num
+            logger.info(
+                f"[HEAD_WISE] update_cache_config: using prefill_kvcache_block_num={cache_config.prefill_kvcache_block_num} "
+                f"(ENABLE_V1_KVCACHE_SCHEDULER=0)"
+            )
 
         # In head-wise mode, free_list should be cache_ids
         if self.enable_head_wise_kv_cache:
             self.total_cache_ids = self.num_gpu_blocks * self.kv_num_heads
             self.gpu_free_block_list = list(range(self.total_cache_ids - 1, -1, -1))
             logger.info(
-                f"[HEAD_WISE] update_cache_config: reset free_list to cache_ids, "
-                f"total_cache_ids={self.total_cache_ids}"
+                f"[HEAD_WISE] update_cache_config: num_gpu_blocks changed from {old_num_gpu_blocks} to {self.num_gpu_blocks}, "
+                f"total_cache_ids changed from {old_total_cache_ids} to {self.total_cache_ids}, "
+                f"kv_num_heads={self.kv_num_heads}, "
+                f"kv_cache_ratio={getattr(cache_config, 'kv_cache_ratio', 'N/A')}, "
+                f"gpu_memory_utilization={getattr(cache_config, 'gpu_memory_utilization', 'N/A')}"
             )
         else:
             self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
+            logger.info(
+                f"update_cache_config: num_gpu_blocks changed from {old_num_gpu_blocks} to {self.num_gpu_blocks}"
+            )
 
         heapq.heapify(self.gpu_free_block_list)
         self.node_id_pool = list(range(self.num_gpu_blocks + self.num_cpu_blocks))
@@ -598,9 +619,16 @@ class PrefixCacheManager:
             head_cache_ids = [block_id * self.kv_num_heads + head_id for block_id in final_block_ids]
             cache_ids_2d.append(head_cache_ids)
 
+        # Format cache_ids for logging (show first few for each head)
+        cache_ids_preview = []
+        for head_id, head_cache_ids in enumerate(cache_ids_2d):
+            preview = head_cache_ids[:3] if len(head_cache_ids) > 3 else head_cache_ids
+            cache_ids_preview.append(f"head{head_id}:{preview}{'...' if len(head_cache_ids) > 3 else ''}")
+
         logger.info(
             f"[HEAD_WISE] req_id:{req_id} allocated block_ids: {final_block_ids}, "
             f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}], "
+            f"cache_ids: [{', '.join(cache_ids_preview)}], "
             f"remaining free cache_ids: {len(self.gpu_free_block_list)}, "
             f"remaining blocks: {len(self.gpu_free_block_list) // self.kv_num_heads}"
         )
@@ -641,9 +669,17 @@ class PrefixCacheManager:
         Args:
             cache_ids_2d: List[List[int]] with shape [kv_num_heads][num_blocks]
         """
+        # Format cache_ids for logging (show first few for each head)
+        cache_ids_preview = []
+        for head_id, head_cache_ids in enumerate(cache_ids_2d):
+            if head_cache_ids:
+                preview = head_cache_ids[:3] if len(head_cache_ids) > 3 else head_cache_ids
+                cache_ids_preview.append(f"head{head_id}:{preview}{'...' if len(head_cache_ids) > 3 else ''}")
+
         logger.info(
             f"[HEAD_WISE] req_id:{req_id} recycle_gpu_blocks_head_wise: "
-            f"shape=[{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}], "
+            f"shape=[{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d and cache_ids_2d[0] else 0}], "
+            f"cache_ids: [{', '.join(cache_ids_preview)}], "
             f"len(self.gpu_free_block_list) before: {len(self.gpu_free_block_list)}"
         )
 
