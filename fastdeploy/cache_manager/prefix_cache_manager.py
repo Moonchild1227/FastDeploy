@@ -32,6 +32,7 @@ from fastdeploy import envs
 from fastdeploy.cache_manager.cache_data import BlockNode, CacheStatus
 from fastdeploy.cache_manager.cache_metrics import CacheMetrics
 from fastdeploy.cache_manager.cache_tasks import ReadStorageTask, WriteStorageTask
+from fastdeploy.cache_manager.headwise_allocator import HeadWiseCacheAllocator
 from fastdeploy.cache_manager.ops import get_all_visible_devices
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.request import Request
@@ -93,14 +94,25 @@ class PrefixCacheManager:
             )
 
         if self.enable_head_wise_kv_cache:
-            # Head-wise mode: free_list maintains cache_id (0 ~ num_blocks * kv_num_heads - 1)
-            # cache_id = block_id * kv_num_heads + head_id
+            # Head-wise mode with True cache_id-based architecture
+            # cache_id is completely free (not encoded with head info)
+            # Physical layout: [cache_id, block_size, head_dim] (real rearrangement, not a view)
             self.total_cache_ids = self.num_gpu_blocks * self.kv_num_heads
-            self.gpu_free_block_list = list(range(self.total_cache_ids - 1, -1, -1))
+
+            # Use HeadWiseCacheAllocator for per-head cache management
+            self.cache_allocator = HeadWiseCacheAllocator(
+                total_cache_ids=self.total_cache_ids, kv_num_heads=self.kv_num_heads
+            )
+
+            # For backward compatibility, maintain gpu_free_block_list as view of allocator's free_list
+            # Note: This is only for metrics/monitoring, actual allocation uses cache_allocator
+            self.gpu_free_block_list = self.cache_allocator.free_list
+
             logger.info(
-                f"[HEAD_WISE] PrefixCacheManager initialized with head-wise mode. "
+                f"[HEAD_WISE] PrefixCacheManager initialized with TRUE cache_id-based architecture. "
                 f"num_gpu_blocks={self.num_gpu_blocks}, kv_num_heads={self.kv_num_heads}, "
                 f"total_cache_ids={self.total_cache_ids}, "
+                f"cache_allocator={self.cache_allocator}, "
                 f"cache_config.total_block_num={self.cache_config.total_block_num}, "
                 f"cache_config.prefill_kvcache_block_num={self.cache_config.prefill_kvcache_block_num}, "
                 f"cache_config.kv_cache_ratio={getattr(self.cache_config, 'kv_cache_ratio', 'N/A')}"
@@ -461,7 +473,7 @@ class PrefixCacheManager:
         """
         # Log before update for debugging
         old_num_gpu_blocks = self.num_gpu_blocks
-        old_total_cache_ids = getattr(self, 'total_cache_ids', None)
+        old_total_cache_ids = getattr(self, "total_cache_ids", None)
 
         self.cache_config = cache_config
         if envs.ENABLE_V1_KVCACHE_SCHEDULER:
@@ -556,83 +568,45 @@ class PrefixCacheManager:
 
     def _allocate_gpu_blocks_head_wise(self, num_blocks, req_id=None):
         """
-        Allocate GPU blocks in head-wise mode.
+        Allocate GPU blocks in head-wise mode with True cache_id-based architecture.
 
-        Key constraint: All heads of the same logical block must be allocated together.
-        This ensures that kernel can access cache[block_id, head_id] correctly.
+        NEW ARCHITECTURE (True cache_id-based):
+        - cache_id is completely free (not encoded with head info)
+        - Each head independently allocates cache_id from shared free_list
+        - Returns 2D cache_ids: [[head_0_cache_ids], [head_1_cache_ids], ...]
+        - Supports unequal head lengths for head-wise SWA
 
-        Strategy: Maintain a block-level view for allocation, then expand to cache_id view.
-        This avoids fragmentation and ensures atomic allocation of all heads per block.
+        Args:
+            num_blocks: Number of blocks to allocate (per head, all equal for now)
+            req_id: Request ID for logging
 
         Returns:
             List[List[int]]: 2D cache_ids with shape [kv_num_heads][num_blocks]
-            cache_ids[head_id][block_idx] = block_id * kv_num_heads + head_id
+            Each head gets its own independent cache_ids
         """
-        # Check availability at block level
-        available_blocks = len(self.gpu_free_block_list) // self.kv_num_heads
-        if num_blocks > available_blocks:
-            raise AssertionError(f"[HEAD_WISE] gpu free block num: {available_blocks} < needed number {num_blocks}")
+        # All heads get the same number of blocks (equal allocation)
+        # For unequal allocation (future work), pass list of blocks per head
+        num_blocks_per_head = [num_blocks] * self.kv_num_heads
 
-        logger.info(f"[HEAD_WISE] req_id:{req_id} allocating {num_blocks} blocks (available: {available_blocks})")
+        # Use HeadWiseCacheAllocator to allocate
+        cache_ids_2d = self.cache_allocator.allocate_per_head(num_blocks_per_head)
 
-        # Step 1: Collect unique block_ids by popping cache_ids
-        # We need to ensure we get complete blocks (all heads)
-        allocated_block_ids = set()
-        temp_cache_ids = []  # Temporarily hold popped cache_ids
-
-        while len(allocated_block_ids) < num_blocks:
-            if not self.gpu_free_block_list:
-                # Should not happen due to earlier check, but safeguard
-                break
-
-            cache_id = heapq.heappop(self.gpu_free_block_list)
-            temp_cache_ids.append(cache_id)
-            block_id = cache_id // self.kv_num_heads
-
-            if block_id not in allocated_block_ids:
-                allocated_block_ids.add(block_id)
-
-        # Step 2: For each allocated block_id, ensure ALL its cache_ids are collected
-        # Remove any partial cache_ids from temp_cache_ids that belong to blocks we're not using
-        final_block_ids = sorted(list(allocated_block_ids))[:num_blocks]
-        final_block_ids_set = set(final_block_ids)
-
-        # Return unused cache_ids back to free_list
-        for cache_id in temp_cache_ids:
-            block_id = cache_id // self.kv_num_heads
-            if block_id not in final_block_ids_set:
-                heapq.heappush(self.gpu_free_block_list, cache_id)
-
-        # Step 3: For final blocks, collect any missing cache_ids from free_list
-        for block_id in final_block_ids:
-            for head_id in range(self.kv_num_heads):
-                cache_id = block_id * self.kv_num_heads + head_id
-                if cache_id not in temp_cache_ids:
-                    # This cache_id should be in free_list, find and remove it
-                    if cache_id in self.gpu_free_block_list:
-                        self.gpu_free_block_list.remove(cache_id)
-                        heapq.heapify(self.gpu_free_block_list)
-
-        # Step 4: Build 2D cache_ids array: [head_id][block_idx]
-        cache_ids_2d = []
-        for head_id in range(self.kv_num_heads):
-            head_cache_ids = [block_id * self.kv_num_heads + head_id for block_id in final_block_ids]
-            cache_ids_2d.append(head_cache_ids)
-
-        # Format cache_ids for logging (show first few for each head)
+        # Format cache_ids for logging
         cache_ids_preview = []
         for head_id, head_cache_ids in enumerate(cache_ids_2d):
             preview = head_cache_ids[:3] if len(head_cache_ids) > 3 else head_cache_ids
             cache_ids_preview.append(f"head{head_id}:{preview}{'...' if len(head_cache_ids) > 3 else ''}")
 
         logger.info(
-            f"[HEAD_WISE] req_id:{req_id} allocated block_ids: {final_block_ids}, "
-            f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}], "
+            f"[HEAD_WISE] req_id:{req_id} allocated {num_blocks} blocks per head, "
+            f"total {sum(num_blocks_per_head)} cache_ids, "
+            f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0])}], "
             f"cache_ids: [{', '.join(cache_ids_preview)}], "
-            f"remaining free cache_ids: {len(self.gpu_free_block_list)}, "
-            f"remaining blocks: {len(self.gpu_free_block_list) // self.kv_num_heads}"
+            f"remaining free cache_ids: {len(self.cache_allocator.free_list)}, "
+            f"allocator stats: {self.cache_allocator.get_stats()}"
         )
 
+        # Update metrics (free_list is managed by allocator now)
         main_process_metrics.free_gpu_block_num.set(len(self.gpu_free_block_list) // self.kv_num_heads)
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
 
@@ -664,12 +638,18 @@ class PrefixCacheManager:
 
     def _recycle_gpu_blocks_head_wise(self, cache_ids_2d, req_id=None):
         """
-        Recycle GPU blocks in head-wise mode.
+        Recycle GPU blocks in head-wise mode with True cache_id-based architecture.
+
+        NEW ARCHITECTURE (True cache_id-based):
+        - cache_ids_2d: 2D list of cache IDs to recycle
+        - Each head's cache_ids are independently recycled to shared free_list
+        - Supports unequal head lengths
 
         Args:
             cache_ids_2d: List[List[int]] with shape [kv_num_heads][num_blocks]
+            req_id: Request ID for logging
         """
-        # Format cache_ids for logging (show first few for each head)
+        # Format cache_ids for logging
         cache_ids_preview = []
         for head_id, head_cache_ids in enumerate(cache_ids_2d):
             if head_cache_ids:
@@ -677,27 +657,25 @@ class PrefixCacheManager:
                 cache_ids_preview.append(f"head{head_id}:{preview}{'...' if len(head_cache_ids) > 3 else ''}")
 
         logger.info(
-            f"[HEAD_WISE] req_id:{req_id} recycle_gpu_blocks_head_wise: "
+            f"[HEAD_WISE] req_id:{req_id} recycling cache_ids, "
             f"shape=[{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d and cache_ids_2d[0] else 0}], "
             f"cache_ids: [{', '.join(cache_ids_preview)}], "
-            f"len(self.gpu_free_block_list) before: {len(self.gpu_free_block_list)}"
+            f"free_list before: {len(self.gpu_free_block_list)}"
         )
 
-        recycled_count = 0
-        for head_cache_ids in cache_ids_2d:
-            for cache_id in head_cache_ids:
-                heapq.heappush(self.gpu_free_block_list, cache_id)
-                recycled_count += 1
+        # Use HeadWiseCacheAllocator to recycle
+        self.cache_allocator.recycle(cache_ids_2d)
 
-        logger.info(
-            f"[HEAD_WISE] req_id:{req_id} recycled {recycled_count} cache_ids, "
-            f"len(self.gpu_free_block_list) after: {len(self.gpu_free_block_list)}"
-        )
-
-        # Report block count, not cache_id count
+        # Update metrics
         free_block_count = len(self.gpu_free_block_list) // self.kv_num_heads
         main_process_metrics.free_gpu_block_num.set(free_block_count)
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
+
+        logger.info(
+            f"[HEAD_WISE] req_id:{req_id} recycled, "
+            f"free_list after: {len(self.gpu_free_block_list)}, "
+            f"allocator stats: {self.cache_allocator.get_stats()}"
+        )
 
     def allocate_cpu_blocks(self, num_blocks):
         """

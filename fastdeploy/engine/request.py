@@ -21,7 +21,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
-from typing import Any, Dict, Generic, Optional
+from typing import Any, Dict, Generic, List, Optional
 from typing import TypeVar as TypingTypeVar
 from typing import Union
 
@@ -171,6 +171,15 @@ class Request:
         # token num
         self.block_tables = []
         self.is_head_wise = False  # Flag for head-wise KV cache mode
+
+        # NEW: True cache_id-based architecture fields
+        # block_tables_3d: Optional[List[List[List[int]]]]  # [kv_heads][num_blocks] storing cache_id
+        # block_lens: Optional[List[int]]  # [kv_heads] number of blocks per head (for unequal heads)
+        # cache_layout: str = "block_head_first"  # "block_head_first" or "cache_id_first"
+        self.block_tables_3d: Optional[List[List[List[int]]]] = None  # Will be set when is_head_wise=True
+        self.block_lens: Optional[List[int]] = None  # Will be set when is_head_wise=True
+        self.cache_layout: str = "block_head_first"  # Default to block_head_first layout
+
         self.output_token_ids = []
         self.num_computed_tokens = num_computed_tokens
         self.prefill_start_index = prefill_start_index

@@ -90,10 +90,17 @@ void AppendAttentionKernel(
     const int speculate_max_draft_token_num,
     const bool causal,
     const bool speculate_decoder,
-    const int sliding_window) {
+    const int sliding_window,
+    const bool enable_head_wise_kv_cache = false,
+    const int max_blocks_per_head = 0) {
   typedef PDTraits<D> traits_;
   typedef typename traits_::DataType DataType_;
   typedef typename traits_::data_t data_t;
+
+  // Create a mutable copy of meta_data to set head-wise fields
+  AppendAttnMetaData mutable_meta_data = meta_data;
+  mutable_meta_data.use_head_wise = enable_head_wise_kv_cache;
+  mutable_meta_data.max_blocks_per_head = max_blocks_per_head;
 
   const int max_len_this_time = set_max_lengths.data<int>()[0];
   const int max_enc_len_this_time = set_max_lengths.data<int>()[1];
@@ -133,7 +140,7 @@ void AppendAttentionKernel(
           const bool lambda_enable_prefill,
           cudaStream_t& lambda_stream) -> void {
     CascadeAppendAttentionKernel<data_t, decltype(temp_args)>(
-        meta_data,
+        mutable_meta_data,
         qkv_out,
         key_cache,
         value_cache,
@@ -285,7 +292,7 @@ void AppendAttentionKernel(
     if (speculate_decoder) {
       if (qkv_out_scales) {
         SpeculateWriteCacheWithRoPEKernel<data_t, int>(
-            meta_data,
+            mutable_meta_data,
             qkv,  // [token_num, num_heads, head_dim]
             seq_lens_decoder,
             seq_lens_encoder,
@@ -312,7 +319,7 @@ void AppendAttentionKernel(
             rms_norm_eps);
       } else {
         SpeculateWriteCacheWithRoPEKernel<data_t, data_t>(
-            meta_data,
+            mutable_meta_data,
             qkv_out,  // [token_num, num_heads, head_dim]
             seq_lens_decoder,
             seq_lens_encoder,
@@ -341,7 +348,7 @@ void AppendAttentionKernel(
     } else {
       if (qkv_out_scales) {
         DecoderWriteCacheWithRoPEKernel<data_t, int>(
-            meta_data,
+            mutable_meta_data,
             qkv,  // [token_num, num_heads, head_dim]
             seq_lens_decoder,
             seq_lens_encoder,
@@ -367,7 +374,7 @@ void AppendAttentionKernel(
             rms_norm_eps);
       } else {
         DecoderWriteCacheWithRoPEKernel<data_t, data_t>(
-            meta_data,
+            mutable_meta_data,
             qkv_out,  // [token_num, num_heads, head_dim]
             seq_lens_decoder,
             seq_lens_encoder,
@@ -495,8 +502,14 @@ std::vector<paddle::Tensor> AppendAttention(
     const int speculate_max_draft_token_num,
     const bool causal,
     const bool speculate_decoder,
-    const int sliding_window) {
+    const int sliding_window,
+    const bool enable_head_wise_kv_cache = false,
+    const int max_blocks_per_head = 0) {
   AppendAttnMetaData meta_data;
+
+  // Set head-wise KV cache parameters in meta_data
+  meta_data.use_head_wise = enable_head_wise_kv_cache;
+  meta_data.max_blocks_per_head = max_blocks_per_head;
 
   const auto& qkv_dims = qkv.dims();
   const auto& key_cache_dims = key_cache.dims();
@@ -705,8 +718,14 @@ std::vector<paddle::Tensor> AppendAttentionWithOutput(
     const int speculate_max_draft_token_num,
     const bool causal,
     const bool speculate_decoder,
-    const int sliding_window) {
+    const int sliding_window,
+    const bool enable_head_wise_kv_cache = false,
+    const int max_blocks_per_head = 0) {
   AppendAttnMetaData meta_data;
+
+  // Set head-wise KV cache parameters in meta_data
+  meta_data.use_head_wise = enable_head_wise_kv_cache;
+  meta_data.max_blocks_per_head = max_blocks_per_head;
 
   const auto& qkv_dims = qkv.dims();
   const auto& key_cache_dims = key_cache.dims();
@@ -1143,6 +1162,8 @@ PD_BUILD_STATIC_OP(append_attention)
         "causal: bool",
         "speculate_decoder: bool",
         "sliding_window: int",
+        "enable_head_wise_kv_cache: bool",
+        "max_blocks_per_head: int",
     })
     .SetKernelFn(PD_KERNEL(AppendAttention))
     .SetInferShapeFn(PD_INFER_SHAPE(AppendAttentionInferShape))

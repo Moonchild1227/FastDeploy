@@ -157,7 +157,23 @@ class GpuWorker(WorkerBase):
             - after_run_meminfo.used
             - paddle_peak_increase
         )
-        available_kv_cache_memory += model_block_memory_used * self.cache_config.total_block_num
+        # In head-wise mode, total_block_num is per-head count, so multiply by kv_num_heads
+        # Also, model_block_memory_used is per layer, so multiply by num_layers
+        if self.model_runner.enable_head_wise_kv_cache:
+            num_layers = (
+                self.model_runner.model_config.num_hidden_layers
+                if self.model_runner.speculative_method not in ["mtp"]
+                else self.model_runner.model_config.num_hidden_layers
+                + self.model_runner.speculative_config.num_gpu_block_expand_ratio
+            )
+            available_kv_cache_memory += (
+                model_block_memory_used
+                * self.cache_config.total_block_num
+                * self.model_runner.kv_num_heads
+                * num_layers
+            )
+        else:
+            available_kv_cache_memory += model_block_memory_used * self.cache_config.total_block_num
 
         end_time = time.perf_counter()
         logger.info(
@@ -172,6 +188,29 @@ class GpuWorker(WorkerBase):
                 f"Profile time: {end_time - start_time}",
             )
         )
+
+        # Log memory calculation details for head-wise mode
+        if self.model_runner.enable_head_wise_kv_cache:
+            num_layers = (
+                self.model_runner.model_config.num_hidden_layers
+                if self.model_runner.speculative_method not in ["mtp"]
+                else self.model_runner.model_config.num_hidden_layers
+                + self.model_runner.speculative_config.num_gpu_block_expand_ratio
+            )
+            added_memory = (
+                model_block_memory_used
+                * self.cache_config.total_block_num
+                * self.model_runner.kv_num_heads
+                * num_layers
+            )
+            logger.info(
+                f"[HEAD_WISE] Memory calculation details: "
+                f"model_block_memory_used={model_block_memory_used / 1024**2:.2f} MB, "
+                f"total_block_num={self.cache_config.total_block_num}, "
+                f"kv_num_heads={self.model_runner.kv_num_heads}, "
+                f"num_layers={num_layers}, "
+                f"added_memory={added_memory / 1024**3:.2f} GB"
+            )
 
         return available_kv_cache_memory  # return to calculate the block num in this device
 

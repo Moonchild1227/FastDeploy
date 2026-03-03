@@ -319,6 +319,121 @@ __global__ void append_decode_cache_T_rope_kernel(
 #endif
 }
 
+// Head-wise KV cache write kernel (additional version for head-wise mode)
+// Cache layout: [max_cache_ids, block_size, head_dim]
+// block_tables layout: [bsz, kv_num_heads, max_blocks_per_head]
+template <typename T, int VecSize = 1>
+__global__ void append_decode_cache_T_rope_headwise_kernel(
+    const T* __restrict__ quant_qkv,  // [bsz, num_heads + 2 * kv_num_heads,
+                                      // head_size]
+    T* __restrict__ key_cache,        // [max_cache_ids, block_size, head_size]
+    T* __restrict__ value_cache,      // [max_cache_ids, block_size, head_size]
+    T* __restrict__ qkv_out,
+    const int* __restrict__ block_tables,  // [bsz, kv_num_heads,
+                                           // max_blocks_per_head]
+    const int* __restrict__ cu_seqlens_q,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ seq_lens_encoder,
+    const float* __restrict__ cos_emb,
+    const float* __restrict__ sin_emb,
+    const int max_seq_len,
+    const int max_blocks_per_head,
+    const int num_heads,
+    const int head_size,
+    const int block_size,
+    const uint32_t elem_cnt,
+    const int kv_num_heads,
+    const bool rope_3d) {
+  using LoadT = AlignedVector<T, VecSize>;
+  using LoadBiasT = AlignedVector<T, VecSize>;
+  using LoadKVT = AlignedVector<T, VecSize>;
+  constexpr int HalfVecSize = VecSize / 2;
+  using LoadEmbT = AlignedVector<float, HalfVecSize>;
+  LoadT src_vec;
+  LoadBiasT out_vec;
+  LoadKVT cache_vec;
+  LoadEmbT cos_emb_vec;
+  LoadEmbT sin_emb_vec;
+
+  int64_t global_thread_idx = blockDim.x * blockIdx.x + threadIdx.x;
+  const int64_t hidden_size = (num_heads + 2 * kv_num_heads) * head_size;
+  const int half_head_size = head_size / 2;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  for (int32_t linear_index = global_thread_idx * VecSize,
+               step = gridDim.x * blockDim.x * VecSize;
+       linear_index < elem_cnt;
+       linear_index += step) {
+    const int ori_bi = linear_index / hidden_size;
+    const int bias = linear_index % hidden_size;
+    const int hi = bias / head_size;  // q + k + v
+    const int h_bias = bias % head_size;
+    const int start_token_idx = cu_seqlens_q[ori_bi];
+    if (seq_lens_encoder[ori_bi] > 0) return;
+    const int write_seq_id = seq_lens[ori_bi];
+    if (write_seq_id == 0) continue;
+
+    // Head-wise: get cache_id from 3D block_tables [bsz][kv_head][block_idx]
+    const int block_offset = write_seq_id % block_size;
+    const int seq_block_idx = write_seq_id / block_size;
+    const uint32_t ori_idx =
+        start_token_idx * hidden_size + hi * head_size + h_bias;
+
+    const int bias_idx = hi * head_size + h_bias;
+    Load<T, VecSize>(&quant_qkv[ori_idx], &src_vec);
+    if (hi < num_heads + kv_num_heads) {
+      // q k rope
+      const uint32_t emb_idx = write_seq_id * half_head_size + h_bias / 2;
+      uint32_t new_emb_idx =
+          rope_3d ? emb_idx + ori_bi * max_seq_len * head_size : emb_idx;
+      Load<float, HalfVecSize>(&cos_emb[new_emb_idx], &cos_emb_vec);
+      Load<float, HalfVecSize>(&sin_emb[new_emb_idx], &sin_emb_vec);
+    }
+#pragma unroll
+    for (int i = 0; i < HalfVecSize; i++) {
+      // dequant + add_bias + rope
+      float input_left = static_cast<float>(src_vec[2 * i]);
+      float input_right = static_cast<float>(src_vec[2 * i + 1]);
+
+      if (hi < num_heads + kv_num_heads) {
+        const float cos_tmp = cos_emb_vec[i];
+        const float sin_tmp = sin_emb_vec[i];
+        out_vec[2 * i] =
+            static_cast<T>(input_left * cos_tmp - input_right * sin_tmp);
+        out_vec[2 * i + 1] =
+            static_cast<T>(input_right * cos_tmp + input_left * sin_tmp);
+      } else {
+        out_vec[2 * i] = src_vec[2 * i];
+        out_vec[2 * i + 1] = src_vec[2 * i + 1];
+      }
+    }
+    if (hi < num_heads) {
+      // write q
+      Store<T, VecSize>(out_vec, &qkv_out[ori_idx]);
+    } else {
+      // Head-wise: get cache_id and compute offset
+      const uint32_t kv_head_idx = (hi - num_heads) % kv_num_heads;
+      // block_tables index: [ori_bi][kv_head_idx][seq_block_idx]
+      const int cache_id =
+          block_tables[ori_bi * kv_num_heads * max_blocks_per_head +
+                       kv_head_idx * max_blocks_per_head + seq_block_idx];
+      // Cache offset: cache[cache_id][block_offset][h_bias]
+      const uint64_t tgt_idx =
+          static_cast<uint64_t>(cache_id) * block_size * head_size +
+          block_offset * head_size + h_bias;
+      if (hi < num_heads + kv_num_heads) {
+        Store<T, VecSize>(out_vec, &key_cache[tgt_idx]);
+      } else {
+        Store<T, VecSize>(out_vec, &value_cache[tgt_idx]);
+      }
+    }
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 template <typename T, int VecSize = 1>
 __global__ void append_decode_cache_T_quant_rope_kernel(
     const int* __restrict__ quant_qkv,  // [bsz, num_heads + 2 * kv_num_heads,

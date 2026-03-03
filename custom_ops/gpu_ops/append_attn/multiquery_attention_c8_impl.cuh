@@ -36,7 +36,8 @@ template <typename T,
 __global__ void multi_query_append_attention_c8_kernel(
     T *__restrict__ q,  // [token_num, (num_heads + 2* kv_num_head) * head_dim]
     CacheT *__restrict__ cache_k,  // [max_block_num, num_heads, block_size,
-                                   // head_dim]
+                                   // head_dim] or [max_cache_ids, block_size,
+                                   // head_dim] if use_head_wise
     CacheT *__restrict__ cache_v,
     const T *__restrict__ cache_k_scale,  // [num_kv_heads] or [max_block_num,
                                           // num_heads, block_size]
@@ -67,7 +68,9 @@ __global__ void multi_query_append_attention_c8_kernel(
     float *__restrict__ tmp_d,      // [token_num, num_chunks, num_heads]
     OutT *__restrict__ out,
     const int speculate_max_draft_token_num = 5,
-    const int sliding_window = 0) {
+    const int sliding_window = 0,
+    const bool use_head_wise = false,
+    const int max_blocks_per_head = 0) {
   constexpr uint32_t num_vecs_per_head =
       HEAD_DIM / num_elems_per_128b<T>();  // 128 / 8 = 16
   constexpr uint32_t num_vecs_per_head_k =
@@ -89,7 +92,15 @@ __global__ void multi_query_append_attention_c8_kernel(
   const uint32_t num_rows_per_block = NUM_WARPS * num_frags_x * 16;
   const int *block_table_now = nullptr;
 
-  block_table_now = block_table + batch_id * max_block_num_per_seq;
+  // Head-wise: block_table layout is [bsz, kv_num_heads, max_blocks_per_head]
+  // Runtime check for head-wise mode (parameters passed from caller)
+
+  if (use_head_wise) {
+    block_table_now =
+        block_table + batch_id * kv_num_heads * max_blocks_per_head;
+  } else {
+    block_table_now = block_table + batch_id * max_block_num_per_seq;
+  }
 
   // When cudagraph capture prefill, may launch more gridDim.x
   if (btid >= static_cast<uint32_t>(num_blocks_x_cpu)) {
@@ -269,22 +280,41 @@ __global__ void multi_query_append_attention_c8_kernel(
                                   (wid * 8 + tid / 4) * kv_d_stride +
                                   tid % 4 * num_elems_per_128b<CacheT>();
 
-  produce_k_blockwise_c8<SharedMemFillMode::kNoFill,
-                         NUM_WARPS,
-                         BLOCK_SIZE,
-                         num_frags_y,
-                         num_frags_z,
-                         NUM_WARP_Q>(k_smem,
-                                     &k_smem_offset_w,
-                                     cache_k,
-                                     block_table_now,
-                                     kv_head_idx,
-                                     kv_n_stride,
-                                     kv_h_stride,
-                                     kv_b_stride,
-                                     kv_idx_base,
-                                     chunk_end,
-                                     const_k_offset);
+  // Head-wise: use headwise produce functions
+  if (use_head_wise) {
+    produce_k_blockwise_c8_headwise<SharedMemFillMode::kNoFill,
+                                    NUM_WARPS,
+                                    BLOCK_SIZE,
+                                    num_frags_y,
+                                    num_frags_z,
+                                    NUM_WARP_Q>(k_smem,
+                                                &k_smem_offset_w,
+                                                cache_k,
+                                                block_table_now,
+                                                kv_head_idx,
+                                                kv_idx_base,
+                                                chunk_end,
+                                                BLOCK_SIZE * HEAD_DIM,
+                                                HEAD_DIM,
+                                                max_blocks_per_head);
+  } else {
+    produce_k_blockwise_c8<SharedMemFillMode::kNoFill,
+                           NUM_WARPS,
+                           BLOCK_SIZE,
+                           num_frags_y,
+                           num_frags_z,
+                           NUM_WARP_Q>(k_smem,
+                                       &k_smem_offset_w,
+                                       cache_k,
+                                       block_table_now,
+                                       kv_head_idx,
+                                       kv_n_stride,
+                                       kv_h_stride,
+                                       kv_b_stride,
+                                       kv_idx_base,
+                                       chunk_end,
+                                       const_k_offset);
+  }
   if constexpr (IsDynamicC8) {
     produce_kv_dynamic_scale_gmem2smem_async<SharedMemFillMode::kFillZero,
                                              BLOCK_SIZE,
@@ -298,22 +328,41 @@ __global__ void multi_query_append_attention_c8_kernel(
                                                          chunk_end);
   }
   commit_group();
-  produce_v_blockwise_c8<SharedMemFillMode::kNoFill,
-                         NUM_WARPS,
-                         BLOCK_SIZE,
-                         num_frags_y,
-                         num_frags_z,
-                         NUM_WARP_Q>(v_smem,
-                                     &v_smem_offset_w,
-                                     cache_v,
-                                     block_table_now,
-                                     kv_head_idx,
-                                     kv_n_stride,
-                                     kv_h_stride,
-                                     kv_d_stride,
-                                     kv_idx_base,
-                                     chunk_end,
-                                     const_v_offset);
+
+  if (use_head_wise) {
+    produce_v_blockwise_c8_headwise<SharedMemFillMode::kNoFill,
+                                    NUM_WARPS,
+                                    BLOCK_SIZE,
+                                    num_frags_y,
+                                    num_frags_z,
+                                    NUM_WARP_Q>(v_smem,
+                                                &v_smem_offset_w,
+                                                cache_v,
+                                                block_table_now,
+                                                kv_head_idx,
+                                                kv_idx_base,
+                                                chunk_end,
+                                                BLOCK_SIZE * HEAD_DIM,
+                                                HEAD_DIM,
+                                                max_blocks_per_head);
+  } else {
+    produce_v_blockwise_c8<SharedMemFillMode::kNoFill,
+                           NUM_WARPS,
+                           BLOCK_SIZE,
+                           num_frags_y,
+                           num_frags_z,
+                           NUM_WARP_Q>(v_smem,
+                                       &v_smem_offset_w,
+                                       cache_v,
+                                       block_table_now,
+                                       kv_head_idx,
+                                       kv_n_stride,
+                                       kv_h_stride,
+                                       kv_d_stride,
+                                       kv_idx_base,
+                                       chunk_end,
+                                       const_v_offset);
+  }
   if constexpr (IsDynamicC8) {
     produce_kv_dynamic_scale_gmem2smem_async<SharedMemFillMode::kFillZero,
                                              BLOCK_SIZE,
@@ -379,22 +428,40 @@ __global__ void multi_query_append_attention_c8_kernel(
 
     const int ori_kv_idx_base = kv_idx_base;
     kv_idx_base += num_frags_z * 16;
-    produce_k_blockwise_c8<SharedMemFillMode::kNoFill,
-                           NUM_WARPS,
-                           BLOCK_SIZE,
-                           num_frags_y,
-                           num_frags_z,
-                           NUM_WARP_Q>(k_smem,
-                                       &k_smem_offset_w,
-                                       cache_k,
-                                       block_table_now,
-                                       kv_head_idx,
-                                       kv_n_stride,
-                                       kv_h_stride,
-                                       kv_b_stride,
-                                       kv_idx_base,
-                                       chunk_end,
-                                       const_k_offset);
+    if (use_head_wise) {
+      produce_k_blockwise_c8_headwise<SharedMemFillMode::kNoFill,
+                                      NUM_WARPS,
+                                      BLOCK_SIZE,
+                                      num_frags_y,
+                                      num_frags_z,
+                                      NUM_WARP_Q>(k_smem,
+                                                  &k_smem_offset_w,
+                                                  cache_k,
+                                                  block_table_now,
+                                                  kv_head_idx,
+                                                  kv_idx_base,
+                                                  chunk_end,
+                                                  BLOCK_SIZE * HEAD_DIM,
+                                                  HEAD_DIM,
+                                                  max_blocks_per_head);
+    } else {
+      produce_k_blockwise_c8<SharedMemFillMode::kNoFill,
+                             NUM_WARPS,
+                             BLOCK_SIZE,
+                             num_frags_y,
+                             num_frags_z,
+                             NUM_WARP_Q>(k_smem,
+                                         &k_smem_offset_w,
+                                         cache_k,
+                                         block_table_now,
+                                         kv_head_idx,
+                                         kv_n_stride,
+                                         kv_h_stride,
+                                         kv_b_stride,
+                                         kv_idx_base,
+                                         chunk_end,
+                                         const_k_offset);
+    }
     if constexpr (IsDynamicC8) {
       produce_kv_dynamic_scale_gmem2smem_async<SharedMemFillMode::kFillZero,
                                                BLOCK_SIZE,
@@ -428,22 +495,40 @@ __global__ void multi_query_append_attention_c8_kernel(
         &v_smem, &v_smem_offset_r, s_frag, o_frag, d_frag, cache_v_scale_reg);
     __syncthreads();
 
-    produce_v_blockwise_c8<SharedMemFillMode::kNoFill,
-                           NUM_WARPS,
-                           BLOCK_SIZE,
-                           num_frags_y,
-                           num_frags_z,
-                           NUM_WARP_Q>(v_smem,
-                                       &v_smem_offset_w,
-                                       cache_v,
-                                       block_table_now,
-                                       kv_head_idx,
-                                       kv_n_stride,
-                                       kv_h_stride,
-                                       kv_d_stride,
-                                       kv_idx_base,
-                                       chunk_end,
-                                       const_v_offset);
+    if (use_head_wise) {
+      produce_v_blockwise_c8_headwise<SharedMemFillMode::kNoFill,
+                                      NUM_WARPS,
+                                      BLOCK_SIZE,
+                                      num_frags_y,
+                                      num_frags_z,
+                                      NUM_WARP_Q>(v_smem,
+                                                  &v_smem_offset_w,
+                                                  cache_v,
+                                                  block_table_now,
+                                                  kv_head_idx,
+                                                  kv_idx_base,
+                                                  chunk_end,
+                                                  BLOCK_SIZE * HEAD_DIM,
+                                                  HEAD_DIM,
+                                                  max_blocks_per_head);
+    } else {
+      produce_v_blockwise_c8<SharedMemFillMode::kNoFill,
+                             NUM_WARPS,
+                             BLOCK_SIZE,
+                             num_frags_y,
+                             num_frags_z,
+                             NUM_WARP_Q>(v_smem,
+                                         &v_smem_offset_w,
+                                         cache_v,
+                                         block_table_now,
+                                         kv_head_idx,
+                                         kv_n_stride,
+                                         kv_h_stride,
+                                         kv_d_stride,
+                                         kv_idx_base,
+                                         chunk_end,
+                                         const_v_offset);
+    }
     if constexpr (IsDynamicC8) {
       produce_kv_dynamic_scale_gmem2smem_async<SharedMemFillMode::kFillZero,
                                                BLOCK_SIZE,
@@ -1316,7 +1401,9 @@ void MultiQueryAppendC8Attention(
           nullptr,
           reinterpret_cast<OUT_NV_TYPE *>(out->data<OutT>()),
           speculate_max_draft_token_num,
-          sliding_window);
+          sliding_window,
+          meta_data.use_head_wise,
+          meta_data.max_blocks_per_head);
     } else {
       phi::Allocator::AllocationPtr tmp_workspace, tmp_m, tmp_d;
       if (ENABLE_PREFILL) {
@@ -1384,7 +1471,9 @@ void MultiQueryAppendC8Attention(
           static_cast<float *>(tmp_d->ptr()),
           reinterpret_cast<OUT_NV_TYPE *>(out->data<OutT>()),
           speculate_max_draft_token_num,
-          sliding_window);
+          sliding_window,
+          meta_data.use_head_wise,
+          meta_data.max_blocks_per_head);
       // merge
       constexpr int vec_size = num_elems_per_128b<NV_TYPE>();
       constexpr int blockx = HEAD_DIM / vec_size;

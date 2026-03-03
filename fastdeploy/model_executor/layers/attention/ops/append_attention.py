@@ -83,6 +83,8 @@ def append_attention(
     causal: bool = True,
     speculate_decoder: bool = False,
     sliding_window: int = 0,
+    enable_head_wise_kv_cache: bool = False,
+    max_blocks_per_head: int = 0,
 ) -> paddle.Tensor:
     """
     append_attention
@@ -142,6 +144,8 @@ def append_attention(
             causal,
             speculate_decoder,
             sliding_window,
+            enable_head_wise_kv_cache,
+            max_blocks_per_head,
         )
         return out
     else:
@@ -206,6 +210,8 @@ def append_attention_with_output(
     causal: bool = True,
     speculate_decoder: bool = False,
     sliding_window: int = 0,
+    enable_head_wise_kv_cache: bool = False,
+    max_blocks_per_head: int = 0,
 ) -> None:
     """
     append_attention
@@ -266,6 +272,8 @@ def append_attention_with_output(
             causal,
             speculate_decoder,
             sliding_window,
+            enable_head_wise_kv_cache,
+            max_blocks_per_head,
         )
     else:
         raise NotImplementedError

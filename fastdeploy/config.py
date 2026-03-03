@@ -1428,13 +1428,37 @@ class CacheConfig:
                 self.model_cfg.num_hidden_layers * kv_num_head * self.model_cfg.head_dim * byte_size
             )
             self.bytes_per_block = int(self.each_token_cache_space * self.block_size)
-            self.bytes_per_layer_per_block = int(
-                self.block_size
-                * self.model_cfg.kv_num_head
-                * self.model_cfg.head_dim
-                // args["tensor_parallel_size"]
-                * byte_size
-            )
+            # In head-wise mode, each "block" (cache_id) only contains data for one head
+            # So we need to adjust both bytes_per_block and bytes_per_layer_per_block
+            if envs.FD_HEAD_WISE_KV_CACHE == 1:
+                # Head-wise mode: cache_id contains only one head's data
+                # bytes_per_block = num_layers * block_size * head_dim * byte_size * 2 (k + v) per cache_id
+                self.bytes_per_block = int(
+                    self.model_cfg.num_hidden_layers
+                    * self.block_size
+                    * self.model_cfg.head_dim
+                    // args["tensor_parallel_size"]
+                    * byte_size
+                    * 2  # k + v
+                )
+                self.bytes_per_layer_per_block = int(
+                    self.block_size * self.model_cfg.head_dim // args["tensor_parallel_size"] * byte_size * 2  # k + v
+                )
+                logger.info(
+                    f"[HEAD_WISE] CacheConfig: adjusted for head-wise mode. "
+                    f"kv_num_head={kv_num_head}, head_dim={self.model_cfg.head_dim}, "
+                    f"bytes_per_block={self.bytes_per_block} (per cache_id, all layers), "
+                    f"bytes_per_layer_per_block={self.bytes_per_layer_per_block} (per cache_id, per layer)"
+                )
+            else:
+                # Original mode: block contains data for all heads
+                self.bytes_per_layer_per_block = int(
+                    self.block_size
+                    * self.model_cfg.kv_num_head
+                    * self.model_cfg.head_dim
+                    // args["tensor_parallel_size"]
+                    * byte_size
+                )
 
         if self.num_cpu_blocks is None:
             if self.swap_space is None:

@@ -586,6 +586,26 @@ class PaddleDisWorkerProc:
             # 2. Calculate the appropriate number of blocks
             model_block_memory_used = self.worker.cal_theortical_kvcache()
             num_blocks_local = int(available_kv_cache_memory // model_block_memory_used)
+
+            # In head-wise mode, model_block_memory_used is per cache_id (single layer),
+            # but available_kv_cache_memory includes all layers (because determine_available_memory
+            # multiplied by num_layers when adding back memory).
+            # So num_blocks_local = (total_cache_ids_all_layers / single_layer_memory_per_cache_id)
+            # = num_layers * total_cache_ids_single_layer
+            # We need to convert to per-head count: divide by (kv_num_heads * num_layers)
+            if self.worker.model_runner.enable_head_wise_kv_cache:
+                kv_num_heads = self.worker.model_runner.kv_num_heads
+                num_layers = (
+                    self.worker.model_runner.model_config.num_hidden_layers
+                    if self.worker.model_runner.speculative_method not in ["mtp"]
+                    else self.worker.model_runner.model_config.num_hidden_layers
+                    + self.worker.model_runner.speculative_config.num_gpu_block_expand_ratio
+                )
+                num_blocks_local = num_blocks_local // (kv_num_heads * num_layers)
+                logger.info(
+                    f"[HEAD_WISE] Converted all-layer cache_ids to per-head count: divided by {kv_num_heads} * {num_layers}"
+                )
+
             # NOTE(liuzichang): Too many block will lead to illegal memory access
             # We will develop dynamic limits in future.
             if num_blocks_local > 40000:

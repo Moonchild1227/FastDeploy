@@ -563,6 +563,342 @@ __device__ __forceinline__ void produce_k_blockwise_c8(
   }
 }
 
+/******************************HEAD-WISE KV CACHE PRODUCE
+ * FUNCTIONS*********************************/
+
+// Head-wise produce_v for c8 layout
+// Cache layout: [max_cache_ids, block_size, head_dim]
+// block_table_now layout: [kv_num_heads, max_blocks_per_head] for current batch
+template <SharedMemFillMode fill_mode,
+          uint32_t num_warps,
+          uint32_t block_size,
+          uint32_t num_frags_y,
+          uint32_t num_frags_z,
+          uint32_t NUM_WARP_Q,
+          typename CacheT>
+__device__ __forceinline__ void produce_v_blockwise_c8_headwise(
+    smem_t smem,
+    uint32_t* smem_offset,
+    CacheT* cache_v,
+    const int* block_table_now,  // [kv_num_heads, max_blocks_per_head]
+    const uint32_t kv_head_idx,
+    const uint32_t kv_idx_base,
+    const uint32_t kv_len,
+    const uint32_t block_stride,  // block_size * head_dim
+    const uint32_t head_dim,
+    const uint32_t max_blocks_per_head) {  // Runtime parameter
+  constexpr uint32_t num_vecs_per_blocksize =
+      block_size / num_elems_per_128b<CacheT>();
+  constexpr uint32_t NUM_WARP_KV = num_warps / NUM_WARP_Q;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t kv_idx = kv_idx_base + tx % 4 * num_elems_per_128b<CacheT>();
+
+  if constexpr (NUM_WARP_Q == 4) {
+    const uint32_t seq_block_idx = kv_idx / block_size;
+    const int cache_id = __ldg(
+        &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+    const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+    CacheT* cache_v_now =
+        cache_v + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+    for (uint32_t i = 0; i < num_frags_y * 2 / num_warps; ++i) {
+#pragma unroll
+      for (uint32_t j = 0; j < num_frags_z / 4; ++j) {
+        smem.load_128b_async<fill_mode>(*smem_offset, cache_v_now, true);
+        *smem_offset = smem.advance_offset_by_column<4, num_vecs_per_blocksize>(
+            *smem_offset, j);
+        cache_v_now += 4 * num_elems_per_128b<CacheT>();
+      }
+      *smem_offset =
+          smem.advance_offset_by_row<num_warps * 8, num_vecs_per_blocksize>(
+              *smem_offset) -
+          num_frags_z;
+      cache_v_now +=
+          num_warps * 8 * head_dim - num_frags_z * num_elems_per_128b<CacheT>();
+    }
+    *smem_offset -= num_frags_y * 16 * num_vecs_per_blocksize;
+  } else {
+#pragma unroll
+    for (uint32_t kv_i = 0; kv_i < NUM_WARP_KV / 2; ++kv_i) {
+      const uint32_t seq_block_idx = kv_idx / block_size;
+      const int cache_id = __ldg(
+          &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+      const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+      CacheT* cache_v_now =
+          cache_v + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+      for (uint32_t i = 0; i < num_frags_y * 2 / num_warps; ++i) {
+#pragma unroll
+        for (uint32_t j = 0; j < 2 * num_frags_z / 4; ++j) {
+          smem.load_128b_async<fill_mode>(*smem_offset, cache_v_now, true);
+          *smem_offset =
+              smem.advance_offset_by_column<4, num_vecs_per_blocksize>(
+                  *smem_offset, j);
+          cache_v_now += 4 * num_elems_per_128b<CacheT>();
+          kv_idx += 4 * num_elems_per_128b<CacheT>();
+        }
+        kv_idx -= 2 * num_frags_z * num_elems_per_128b<CacheT>();
+        *smem_offset =
+            smem.advance_offset_by_row<num_warps * 8, num_vecs_per_blocksize>(
+                *smem_offset) -
+            2 * num_frags_z;
+        cache_v_now += num_warps * 8 * head_dim -
+                       2 * num_frags_z * num_elems_per_128b<CacheT>();
+      }
+      kv_idx += block_size;
+    }
+    *smem_offset -= NUM_WARP_KV / 2 * num_frags_y * 16 * num_vecs_per_blocksize;
+  }
+}
+
+// Head-wise produce_k for c8 layout
+template <SharedMemFillMode fill_mode,
+          uint32_t num_warps,
+          uint32_t block_size,
+          uint32_t num_frags_y,
+          uint32_t num_frags_z,
+          uint32_t NUM_WARP_Q,
+          typename CacheT>
+__device__ __forceinline__ void produce_k_blockwise_c8_headwise(
+    smem_t smem,
+    uint32_t* smem_offset,
+    CacheT* cache_k,
+    const int* block_table_now,
+    const uint32_t kv_head_idx,
+    const uint32_t kv_idx_base,
+    const uint32_t kv_len,
+    const uint32_t block_stride,
+    const uint32_t head_dim,
+    const uint32_t max_blocks_per_head) {  // Runtime parameter
+  constexpr uint32_t num_vecs_per_head =
+      num_frags_y * 16 / num_elems_per_128b<CacheT>();
+  constexpr uint32_t NUM_WARP_KV = num_warps / NUM_WARP_Q;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t kv_idx = kv_idx_base + ty * 4 + tx / 8;
+
+  if constexpr (NUM_WARP_Q == 4) {
+    const uint32_t seq_block_idx = kv_idx / block_size;
+    const int cache_id = __ldg(
+        &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+    const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+    CacheT* cache_k_now =
+        cache_k + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
+#pragma unroll
+      for (uint32_t j = 0; j < num_frags_y / 8; ++j) {
+        smem.load_128b_async<fill_mode>(*smem_offset, cache_k_now, true);
+        *smem_offset = smem.advance_offset_by_column<8, num_vecs_per_head>(
+            *smem_offset, j);
+        cache_k_now += 8 * num_elems_per_128b<CacheT>();
+      }
+      *smem_offset =
+          smem.advance_offset_by_row<num_warps * 4, num_vecs_per_head>(
+              *smem_offset) -
+          num_frags_y;
+      cache_k_now +=
+          num_warps * 4 * head_dim - num_frags_y * num_elems_per_128b<CacheT>();
+    }
+    *smem_offset -= num_frags_z * 16 * num_vecs_per_head;
+  } else {
+#pragma unroll
+    for (uint32_t kv_i = 0; kv_i < NUM_WARP_KV / 2; ++kv_i) {
+      const uint32_t seq_block_idx = kv_idx / block_size;
+      const int cache_id = __ldg(
+          &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+      const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+      CacheT* cache_k_now =
+          cache_k + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+      for (uint32_t i = 0; i < 2 * num_frags_z * 4 / num_warps; ++i) {
+#pragma unroll
+        for (uint32_t j = 0; j < num_frags_y / 8; ++j) {
+          smem.load_128b_async<fill_mode>(*smem_offset, cache_k_now, true);
+          *smem_offset = smem.advance_offset_by_column<8, num_vecs_per_head>(
+              *smem_offset, j);
+          cache_k_now += 8 * num_elems_per_128b<CacheT>();
+        }
+        kv_idx += num_warps * 4;
+        *smem_offset =
+            smem.advance_offset_by_row<num_warps * 4, num_vecs_per_head>(
+                *smem_offset) -
+            num_frags_y;
+        cache_k_now += num_warps * 4 * head_dim -
+                       num_frags_y * num_elems_per_128b<CacheT>();
+      }
+    }
+    *smem_offset -= NUM_WARP_KV / 2 * num_frags_z * 16 * num_vecs_per_head;
+  }
+}
+
+/******************************HEAD-WISE KV CACHE PRODUCE FUNCTIONS FOR
+ * C16*********************************/
+
+// Head-wise produce_v for c16 layout (fp16/bf16)
+// Cache layout: [max_cache_ids, block_size, head_dim]
+// block_table_now layout: [kv_num_heads, max_blocks_per_head] for current batch
+template <SharedMemFillMode fill_mode,
+          uint32_t num_warps,
+          uint32_t block_size,
+          uint32_t num_frags_y,
+          uint32_t num_frags_z,
+          uint32_t NUM_WARP_Q,
+          typename T>
+__device__ __forceinline__ void produce_v_blockwise_c16_headwise(
+    smem_t smem,
+    uint32_t* smem_offset,
+    T* cache_v,
+    const int* block_table_now,  // [kv_num_heads, max_blocks_per_head]
+    const uint32_t kv_head_idx,
+    const uint32_t kv_idx_base,
+    const uint32_t kv_len,
+    const uint32_t block_stride,  // block_size * head_dim
+    const uint32_t head_dim,
+    const uint32_t max_blocks_per_head) {  // Runtime parameter
+  constexpr uint32_t num_vecs_per_blocksize =
+      block_size / num_elems_per_128b<T>();
+  constexpr uint32_t NUM_WARP_KV = num_warps / NUM_WARP_Q;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t kv_idx = kv_idx_base + tx % 8 * num_elems_per_128b<T>();
+
+  if constexpr (NUM_WARP_Q == 4) {
+    const uint32_t seq_block_idx = kv_idx / block_size;
+    const int cache_id = __ldg(
+        &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+    const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+    T* cache_v_now =
+        cache_v + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+    for (uint32_t i = 0; i < num_frags_y * 2 / num_warps; ++i) {
+#pragma unroll
+      for (uint32_t j = 0; j < num_frags_z / 4; ++j) {
+        smem.load_128b_async<fill_mode>(*smem_offset, cache_v_now, true);
+        *smem_offset = smem.advance_offset_by_column<8, num_vecs_per_blocksize>(
+            *smem_offset, j);
+        cache_v_now += 8 * num_elems_per_128b<T>();
+      }
+      *smem_offset =
+          smem.advance_offset_by_row<num_warps * 8, num_vecs_per_blocksize>(
+              *smem_offset) -
+          num_frags_z * 2;
+      cache_v_now +=
+          num_warps * 8 * head_dim - num_frags_z * 2 * num_elems_per_128b<T>();
+    }
+    *smem_offset -= num_frags_y * 16 * num_vecs_per_blocksize;
+  } else {
+#pragma unroll
+    for (uint32_t kv_i = 0; kv_i < NUM_WARP_KV; ++kv_i) {
+      const uint32_t seq_block_idx = kv_idx / block_size;
+      const int cache_id = __ldg(
+          &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+      const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+      T* cache_v_now =
+          cache_v + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+      for (uint32_t i = 0; i < num_frags_y / num_warps; ++i) {
+#pragma unroll
+        for (uint32_t j = 0; j < num_frags_z / 4; ++j) {
+          smem.load_128b_async<fill_mode>(*smem_offset, cache_v_now, true);
+          *smem_offset =
+              smem.advance_offset_by_column<8, num_vecs_per_blocksize>(
+                  *smem_offset, j);
+          cache_v_now += 8 * num_elems_per_128b<T>();
+          kv_idx += num_warps * 4 * num_elems_per_128b<T>();
+        }
+        kv_idx -= num_frags_z * num_elems_per_128b<T>();
+        *smem_offset =
+            smem.advance_offset_by_row<num_warps * 4, num_vecs_per_blocksize>(
+                *smem_offset) -
+            num_frags_z * 2;
+        cache_v_now += num_warps * 4 * head_dim -
+                       num_frags_z * 2 * num_elems_per_128b<T>();
+      }
+      kv_idx += block_size;
+    }
+    *smem_offset -= NUM_WARP_KV * num_frags_y * 16 * num_vecs_per_blocksize;
+  }
+}
+
+// Head-wise produce_k for c16 layout (fp16/bf16)
+template <SharedMemFillMode fill_mode,
+          uint32_t num_warps,
+          uint32_t block_size,
+          uint32_t num_frags_y,
+          uint32_t num_frags_z,
+          uint32_t NUM_WARP_Q,
+          typename T>
+__device__ __forceinline__ void produce_k_blockwise_c16_headwise(
+    smem_t smem,
+    uint32_t* smem_offset,
+    T* cache_k,
+    const int* block_table_now,  // [kv_num_heads, max_blocks_per_head]
+    const uint32_t kv_head_idx,
+    const uint32_t kv_idx_base,
+    const uint32_t kv_len,
+    const uint32_t block_stride,  // block_size * head_dim
+    const uint32_t head_dim,
+    const uint32_t max_blocks_per_head) {  // Runtime parameter
+  constexpr uint32_t num_vecs_per_head =
+      num_frags_y * 16 / num_elems_per_128b<T>();
+  constexpr uint32_t NUM_WARP_KV = num_warps / NUM_WARP_Q;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t kv_idx = kv_idx_base + ty * 4 + tx / 8;
+
+  if constexpr (NUM_WARP_Q == 4) {
+    const uint32_t seq_block_idx = kv_idx / block_size;
+    const int cache_id = __ldg(
+        &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+    const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+    T* cache_k_now =
+        cache_k + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
+#pragma unroll
+      for (uint32_t j = 0; j < num_frags_y / 8; ++j) {
+        smem.load_128b_async<fill_mode>(*smem_offset, cache_k_now, true);
+        *smem_offset = smem.advance_offset_by_column<8, num_vecs_per_head>(
+            *smem_offset, j);
+        cache_k_now += 8 * num_elems_per_128b<T>();
+      }
+      *smem_offset =
+          smem.advance_offset_by_row<num_warps * 4, num_vecs_per_head>(
+              *smem_offset) -
+          num_frags_y;
+      cache_k_now +=
+          num_warps * 4 * head_dim - num_frags_y * num_elems_per_128b<T>();
+    }
+    *smem_offset -= num_frags_z * 16 * num_vecs_per_head;
+  } else {
+#pragma unroll
+    for (uint32_t kv_i = 0; kv_i < NUM_WARP_KV / 2; ++kv_i) {
+      const uint32_t seq_block_idx = kv_idx / block_size;
+      const int cache_id = __ldg(
+          &block_table_now[kv_head_idx * max_blocks_per_head + seq_block_idx]);
+      const int valid_cache_id = (cache_id < 0) ? 0 : cache_id;
+      T* cache_k_now =
+          cache_k + static_cast<uint64_t>(valid_cache_id) * block_stride;
+#pragma unroll
+      for (uint32_t i = 0; i < 2 * num_frags_z * 4 / num_warps; ++i) {
+#pragma unroll
+        for (uint32_t j = 0; j < num_frags_y / 8; ++j) {
+          smem.load_128b_async<fill_mode>(*smem_offset, cache_k_now, true);
+          *smem_offset = smem.advance_offset_by_column<8, num_vecs_per_head>(
+              *smem_offset, j);
+          cache_k_now += 8 * num_elems_per_128b<T>();
+        }
+        kv_idx += num_warps * 4;
+        *smem_offset =
+            smem.advance_offset_by_row<num_warps * 4, num_vecs_per_head>(
+                *smem_offset) -
+            num_frags_y;
+        cache_k_now +=
+            num_warps * 4 * head_dim - num_frags_y * num_elems_per_128b<T>();
+      }
+    }
+    *smem_offset -= NUM_WARP_KV / 2 * num_frags_z * 16 * num_vecs_per_head;
+  }
+}
+
 template <SharedMemFillMode fill_mode,
           uint32_t num_warps,
           uint32_t block_size,

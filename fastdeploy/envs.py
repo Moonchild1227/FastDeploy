@@ -51,9 +51,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and "MLA_ATTN" can be set currently.
     "FD_ATTENTION_BACKEND": lambda: os.getenv("FD_ATTENTION_BACKEND", "APPEND_ATTN"),
     # Enable head-wise KV cache management.
-    # When enabled, cache allocation/tracking is done per-head (cache_id = block_id * kv_num_heads + head_id).
-    # The physical tensor layout is reshaped to [block * head, token, dim] as a view.
-    # Kernel behavior remains unchanged (still uses block_id).
+    # When enabled, cache allocation/tracking is done per-head.
+    # Cache_id is completely free (not encoded with head info like block_id * kv_heads + head_id).
+    # Physical layout is [cache_id, block_size, head_dim] (real memory rearrangement).
+    # block_tables is 3D: [batch][head][block] storing cache_id directly.
+    # Kernel uses cache_id directly for indexing (no block_id = cache_id // kv_heads conversion).
+    # This supports true head-wise SWA with unequal head lengths.
     "FD_HEAD_WISE_KV_CACHE": lambda: int(os.getenv("FD_HEAD_WISE_KV_CACHE", "0")),
     # Set sampling class. "base", "base_non_truncated", "air" and "rejection" can be set currently.
     "FD_SAMPLING_CLASS": lambda: os.getenv("FD_SAMPLING_CLASS", "base"),

@@ -142,6 +142,15 @@ class ForwardMeta:
     pre_caches_length: int = 0
     # Block tables
     block_tables: Optional[paddle.Tensor] = None
+
+    # Head-wise KV cache: 3D block_tables and block_lens for True cache_id-based architecture
+    # block_tables_3d: [batch_size, kv_num_heads, max_blocks_per_head] storing cache_id directly
+    # block_lens: [batch_size, kv_num_heads] number of blocks per head
+    block_tables_3d: Optional[paddle.Tensor] = None
+    block_lens: Optional[paddle.Tensor] = None
+    # Flag indicating if head-wise mode is enabled for this forward pass
+    enable_head_wise_kv_cache: bool = False
+
     # KV caches
     caches: Optional[list[paddle.Tensor]] = None
     # Flag of profile run
@@ -424,6 +433,10 @@ class HPUForwardMeta(ForwardMeta):
             seq_lens_decoder=share_inputs["seq_lens_decoder"],
             seq_lens_this_time=share_inputs["seq_lens_this_time"],
             block_tables=share_inputs["block_tables"],
+            # Head-wise KV cache: 3D block_tables if available
+            block_tables_3d=share_inputs.get("block_tables_3d"),
+            block_lens=share_inputs.get("block_lens"),
+            enable_head_wise_kv_cache=share_inputs.get("block_tables_3d") is not None,
             rotary_embs_encoder=share_inputs["rotary_embs_encoder"],
             block_groups_encoder=share_inputs["block_groups_encoder"],
             block_list_encoder=share_inputs["block_list_encoder"],
