@@ -1102,7 +1102,8 @@ __global__ void cache_kernel(
                                   // head_size]
     T *__restrict__ value_cache,  // [num_blocks, kv_num_heads, block_size,
                                   // head_size]
-    const int *__restrict__ block_tables,        // [bsz, max_blocks_per_seq]
+    const int *__restrict__ block_tables,  // non head-wise: [bsz, max_blocks_per_seq]
+                                           // head-wise (flattened): [bsz * kv_heads, max_blocks_per_head]
     const int *__restrict__ batch_id_per_token,  // [num_tokens]
     const int *__restrict__ cu_seqlens_q,        // [bsz]
     const int *__restrict__ seq_lens,            // [bsz]
@@ -1113,7 +1114,9 @@ __global__ void cache_kernel(
     const int head_size,
     const int block_size,
     const uint32_t elem_cnt,
-    const int kv_num_heads) {
+    const int kv_num_heads,
+    const bool use_head_wise,
+    const int max_blocks_per_head) {
   using LoadT = AlignedVector<T, VecSize>;
   LoadT src_vec;
 
@@ -1139,16 +1142,28 @@ __global__ void cache_kernel(
     const uint32_t ori_seq_id =
         (token_idx - cu_seqlens_q[ori_bi]) + seq_lens_decoder[ori_bi];
 
-    const int32_t *block_table_now = nullptr;
-
-    block_table_now = block_tables + ori_bi * max_blocks_per_seq;
-
-    const uint32_t block_idx = block_table_now[ori_seq_id / block_size];
+    const uint32_t seq_block_idx = ori_seq_id / block_size;
     const uint32_t block_offset = ori_seq_id % block_size;
 
-    const uint32_t tgt_idx = block_idx * kv_num_heads * block_size * head_size +
-                             hi * block_size * head_size +
-                             block_offset * head_size + h_bias;
+    uint32_t tgt_idx = 0;
+    if (use_head_wise) {
+      const int32_t *block_table_now =
+          block_tables + ori_bi * kv_num_heads * max_blocks_per_head;
+      const int cache_id =
+          __ldg(&block_table_now[hi * max_blocks_per_head + seq_block_idx]);
+      if (cache_id < 0) {
+        continue;
+      }
+      tgt_idx = cache_id * block_size * head_size +
+                block_offset * head_size + h_bias;
+    } else {
+      const int32_t *block_table_now =
+          block_tables + ori_bi * max_blocks_per_seq;
+      const uint32_t block_idx = block_table_now[seq_block_idx];
+      tgt_idx = block_idx * kv_num_heads * block_size * head_size +
+                hi * block_size * head_size +
+                block_offset * head_size + h_bias;
+    }
     const uint32_t ori_idx =
         token_idx * (num_heads + 2 * kv_num_heads) * head_size +
         num_heads * head_size + qkv_id * hidden_size + hi * head_size + h_bias;
@@ -2696,7 +2711,9 @@ void CascadeAppendWriteCacheKVQKV(
       head_dim,
       block_size,
       elem_nums,
-      kv_num_heads);
+      kv_num_heads,
+      meta_data.use_head_wise,
+      meta_data.max_blocks_per_head);
 }
 
 template <typename T, uint32_t HEAD_DIM, uint32_t BLOCK_SIZE>

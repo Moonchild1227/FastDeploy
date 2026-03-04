@@ -265,60 +265,24 @@ class GPUModelRunner(ModelRunnerBase):
         """
         Get block_tables and metadata for kernel execution.
 
-        NEW ARCHITECTURE (True cache_id-based):
-        - When enable_head_wise_kv_cache=True and request.is_head_wise=True:
-          - Returns dict with block_tables_3d and block_lens
-          - block_tables_3d: [kv_num_heads][max_blocks_per_head] storing cache_id directly
-          - block_lens: [kv_num_heads] number of blocks per head
-          - is_head_wise: True to indicate head-wise mode
-
-        OLD ARCHITECTURE (View-based):
-        - Returns 1D block_ids list (for backward compatibility)
+        This is only used in non-head-wise mode.
+        Returns 1D block_ids list.
 
         Args:
             request: Request object with block_tables metadata
 
         Returns:
-            dict or list: Metadata for kernel execution
+            list: block_ids for kernel execution
         """
-        if self.enable_head_wise_kv_cache and request.is_head_wise:
-            # NEW: True cache_id-based architecture
-            if request.block_tables_3d:
-                # Already have 3D block_tables and block_lens from allocator
-                max_blocks = max(len(head_blocks) for head_blocks in request.block_tables_3d)
-
-                logger.debug(
-                    f"[HEAD_WISE] request {request.request_id}: "
-                    f"using TRUE cache_id-based architecture, "
-                    f"block_tables_3d shape=[{len(request.block_tables_3d)}][{max_blocks}], "
-                    f"block_lens={request.block_lens}"
-                )
-
-                return {
-                    "block_tables_3d": request.block_tables_3d,
-                    "block_lens": request.block_lens,
-                    "cache_layout": "cache_id_first",
-                    "is_head_wise": True,
-                }
-            else:
-                return {
-                    "block_tables_3d": None,
-                    "block_lens": None,
-                    "cache_layout": "cache_id_first",
-                    "is_head_wise": True,
-                }
-        else:
-            # OLD: Normal mode or view-based head-wise
-            # Return 1D block_ids directly
-            return request.block_tables
+        return request.block_tables
 
     def _prepare_batch_headwise_metadata(self, requests: List[Request], indices: List[int]) -> Optional[dict]:
         """
         Prepare batch-level head-wise metadata (flattened 2D block_tables and block_lens).
 
         For True cache_id-based architecture:
-        - Flattens 3D block_tables [batch, kv_heads, max_blocks] to 2D [batch*kv_heads, max_blocks]
-        - Index formula: block_id = block_tables[kv_head_idx * max_blocks + block_idx]
+        - Flattens per-request block_tables_3d [kv_heads, max_blocks] to 2D [batch*kv_heads, max_blocks]
+        - Index formula: block_id = block_tables[(batch_id * kv_num_heads + kv_head_idx) * max_blocks + block_idx]
         - This allows reuse of existing block_tables parameter without changing kernel interface
 
         Args:
@@ -328,21 +292,19 @@ class GPUModelRunner(ModelRunnerBase):
         Returns:
             dict with flattened metadata if any head-wise request exists, None otherwise
         """
-        # Filter head-wise requests
-        headwise_requests = [
-            (idx, req) for idx, req in zip(indices, requests) if req.is_head_wise and req.block_tables_3d is not None
-        ]
-
-        if not headwise_requests:
+        if not requests:
             return None
 
-        batch_size = len(headwise_requests)
+        batch_size = int(self.share_inputs["block_tables"].shape[0])
         kv_num_heads = self.kv_num_heads
 
         # Calculate max blocks per head across all requests
         max_blocks_per_head = 0
-        for idx, req in headwise_requests:
-            for head_blocks in req.block_tables_3d:
+        for req in requests:
+            block_tables_3d = getattr(req, "block_tables_3d", None)
+            if not block_tables_3d:
+                continue
+            for head_blocks in block_tables_3d:
                 max_blocks_per_head = max(max_blocks_per_head, len(head_blocks))
 
         # Initialize flattened 2D block_tables: [batch_size * kv_num_heads, max_blocks_per_head]
@@ -352,12 +314,15 @@ class GPUModelRunner(ModelRunnerBase):
         block_lens = np.zeros((batch_size * kv_num_heads,), dtype=np.int32)
 
         # Fill in the data
-        for batch_idx, (orig_idx, req) in enumerate(headwise_requests):
+        for batch_idx, req in zip(indices, requests):
+            block_tables_3d = getattr(req, "block_tables_3d", None)
+            if not block_tables_3d:
+                continue
             for head_id in range(kv_num_heads):
-                if head_id < len(req.block_tables_3d):
-                    head_blocks = req.block_tables_3d[head_id]
-                    flat_idx = batch_idx * kv_num_heads + head_id
-                    block_lens[flat_idx] = len(head_blocks)
+                head_blocks = block_tables_3d[head_id] if head_id < len(block_tables_3d) else []
+                flat_idx = batch_idx * kv_num_heads + head_id
+                block_lens[flat_idx] = len(head_blocks)
+                if head_blocks:
                     block_tables_2d[flat_idx, : len(head_blocks)] = head_blocks
 
         logger.debug(
@@ -372,7 +337,7 @@ class GPUModelRunner(ModelRunnerBase):
             "block_tables_2d": block_tables_2d,
             "block_lens": block_lens,
             "max_blocks_per_head": max_blocks_per_head,
-            "original_indices": [idx for idx, _ in headwise_requests],
+            "indices": indices,
             "kv_num_heads": kv_num_heads,
         }
 
@@ -783,6 +748,9 @@ class GPUModelRunner(ModelRunnerBase):
 
         # Collect head-wise requests for batch-level metadata preparation
         headwise_requests_info = []  # List of (idx, request) tuples
+        if self.enable_head_wise_kv_cache:
+            # Clear stale head-wise metadata; will be set if any request exists this step.
+            self.share_inputs["block_tables_3d"] = None
 
         batch_pooling_params = []
         for i in range(req_len):
@@ -846,11 +814,7 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["input_ids"][idx : idx + 1, :length] = np.array(
                     input_ids[prefill_start_index:prefill_end_index]
                 )
-                # Get block_tables for kernel (handle head-wise mode)
-                block_tables_for_kernel = self._get_block_tables_for_kernel(request)
-
-                # Handle head-wise vs normal mode
-                if isinstance(block_tables_for_kernel, dict) and block_tables_for_kernel.get("is_head_wise"):
+                if self.enable_head_wise_kv_cache:
                     # Head-wise mode: collect for batch-level processing
                     headwise_requests_info.append((idx, request))
                     # Set placeholder values for now (will be overwritten by batch metadata)
@@ -859,6 +823,7 @@ class GPUModelRunner(ModelRunnerBase):
                     self.share_inputs["block_tables"][idx : idx + 1, :] = -1
                 else:
                     # Normal mode: use 1D block_tables
+                    block_tables_for_kernel = self._get_block_tables_for_kernel(request)
                     encoder_block_num = len(block_tables_for_kernel)
                     self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
                     self.share_inputs["block_tables"][idx : idx + 1, :] = -1
@@ -896,11 +861,7 @@ class GPUModelRunner(ModelRunnerBase):
                     self.exist_prefill_flag = False
             elif request.task_type.value == RequestType.DECODE.value:  # decode task
                 logger.debug(f"Handle decode request {request} at idx {idx}")
-                # Get block_tables for kernel (handle head-wise mode)
-                block_tables_for_kernel = self._get_block_tables_for_kernel(request)
-
-                # Handle head-wise vs normal mode
-                if isinstance(block_tables_for_kernel, dict) and block_tables_for_kernel.get("is_head_wise"):
+                if self.enable_head_wise_kv_cache:
                     # Head-wise mode: collect for batch-level processing
                     headwise_requests_info.append((idx, request))
                     # Set placeholder values for now (will be overwritten by batch metadata)
@@ -909,6 +870,7 @@ class GPUModelRunner(ModelRunnerBase):
                     self.share_inputs["block_tables"][idx : idx + 1, :] = -1
                 else:
                     # Normal mode: use 1D block_tables
+                    block_tables_for_kernel = self._get_block_tables_for_kernel(request)
                     encoder_block_num = len(block_tables_for_kernel)
                     self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
                     self.share_inputs["block_tables"][idx : idx + 1, :] = -1
@@ -1009,34 +971,20 @@ class GPUModelRunner(ModelRunnerBase):
                 block_tables_2d = headwise_metadata["block_tables_2d"]
                 block_lens = headwise_metadata["block_lens"]
                 max_blocks_per_head = headwise_metadata["max_blocks_per_head"]
-                original_indices = headwise_metadata["original_indices"]
+                indices = headwise_metadata["indices"]
                 kv_num_heads = headwise_metadata["kv_num_heads"]
 
-                # Fill share_inputs["block_tables"] with flattened data
-                # For head-wise requests: block_tables[i] = block_tables_2d[i]
-                for flat_idx, orig_idx in enumerate(original_indices):
-                    for head_id in range(kv_num_heads):
-                        batch_flat_idx = flat_idx * kv_num_heads + head_id
-                        # Store head's block table at original batch index position
-                        # Kernel will use: block_tables[kv_head_idx * max_blocks + block_idx]
-                        start_idx = orig_idx * max_blocks_per_head
-                        end_idx = start_idx + max_blocks_per_head
-                        if start_idx < self.share_inputs["block_tables"].shape[1]:
-                            self.share_inputs["block_tables"][orig_idx, start_idx:end_idx] = block_tables_2d[
-                                batch_flat_idx
-                            ]
-
                 # Update encoder_block_lens for head-wise requests
-                for batch_idx, orig_idx in enumerate(original_indices):
-                    # Sum blocks across all heads for this request
-                    block_len_start = batch_idx * kv_num_heads
+                for orig_idx in indices:
+                    # Logical block count per request (per-head length)
+                    block_len_start = orig_idx * kv_num_heads
                     block_len_end = block_len_start + kv_num_heads
-                    total_blocks = int(block_lens[block_len_start:block_len_end].sum())
-                    self.share_inputs["encoder_block_lens"][orig_idx : orig_idx + 1] = total_blocks
+                    per_head_lens = block_lens[block_len_start:block_len_end]
+                    logical_blocks = int(per_head_lens.max()) if per_head_lens.size > 0 else 0
+                    self.share_inputs["encoder_block_lens"][orig_idx : orig_idx + 1] = logical_blocks
 
                 # Store metadata for ForwardMeta
-                self.share_inputs["block_tables_3d"] = block_tables_2d
-                self.share_inputs["block_lens"] = block_lens
+                self.share_inputs["block_tables_3d"] = paddle.to_tensor(block_tables_2d, dtype="int32")
 
                 logger.debug(
                     f"[HEAD_WISE] Prepared flattened metadata for {len(headwise_requests_info)} requests, "
@@ -1063,6 +1011,10 @@ class GPUModelRunner(ModelRunnerBase):
             os.environ["PREFILL_NODE_ONE_STEP_STOP"] = "1"
 
         req_len = len(req_dicts)
+        headwise_requests_info = []
+        if self.enable_head_wise_kv_cache:
+            # Clear stale head-wise metadata; will be set if any request exists this step.
+            self.share_inputs["block_tables_3d"] = None
         for i in range(req_len):
             request = req_dicts[i]
             idx = request.idx
@@ -1230,14 +1182,20 @@ class GPUModelRunner(ModelRunnerBase):
 
             if request.get("seed") is not None:
                 self.share_inputs["infer_seed"][idx : idx + 1] = request.get("seed")
-            # Get block_tables for kernel (handle head-wise mode)
-            block_tables_for_kernel = self._get_block_tables_for_kernel(request)
-            encoder_block_num = len(block_tables_for_kernel)
-            self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
-            self.share_inputs["block_tables"][idx : idx + 1, :] = -1
-            self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
-                block_tables_for_kernel, dtype="int32"
-            )
+            if self.enable_head_wise_kv_cache:
+                # Head-wise mode: collect for batch-level processing
+                headwise_requests_info.append((idx, request))
+                # Set placeholder values for now (will be overwritten by batch metadata)
+                self.share_inputs["encoder_block_lens"][idx : idx + 1] = 0
+                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
+            else:
+                block_tables_for_kernel = self._get_block_tables_for_kernel(request)
+                encoder_block_num = len(block_tables_for_kernel)
+                self.share_inputs["encoder_block_lens"][idx : idx + 1] = encoder_block_num
+                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
+                self.share_inputs["block_tables"][idx : idx + 1, :encoder_block_num] = np.array(
+                    block_tables_for_kernel, dtype="int32"
+                )
 
             if request.get("bad_words_token_ids") is not None and len(request.get("bad_words_token_ids")) > 0:
                 bad_words_len = len(request.get("bad_words_token_ids"))
@@ -1263,6 +1221,25 @@ class GPUModelRunner(ModelRunnerBase):
                 self.share_inputs["stop_seqs_len"][idx : idx + 1, :] = 0
 
             self.sampler.apply_logits_processor(idx, logits_info, prefill_tokens)
+
+        if headwise_requests_info and self.enable_head_wise_kv_cache:
+            indices = [idx for idx, _ in headwise_requests_info]
+            requests = [req for _, req in headwise_requests_info]
+            headwise_metadata = self._prepare_batch_headwise_metadata(requests, indices)
+            if headwise_metadata is not None:
+                block_tables_2d = headwise_metadata["block_tables_2d"]
+                block_lens = headwise_metadata["block_lens"]
+                indices = headwise_metadata["indices"]
+                kv_num_heads = headwise_metadata["kv_num_heads"]
+
+                for orig_idx in indices:
+                    block_len_start = orig_idx * kv_num_heads
+                    block_len_end = block_len_start + kv_num_heads
+                    per_head_lens = block_lens[block_len_start:block_len_end]
+                    logical_blocks = int(per_head_lens.max()) if per_head_lens.size > 0 else 0
+                    self.share_inputs["encoder_block_lens"][orig_idx : orig_idx + 1] = logical_blocks
+
+                self.share_inputs["block_tables_3d"] = paddle.to_tensor(block_tables_2d, dtype="int32")
 
         self.share_inputs["not_need_stop"][0] = True
 
@@ -1384,9 +1361,30 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["first_token_ids"][idx : idx + 1] = self.share_inputs["input_ids"][idx : idx + 1, :1]
 
             self.share_inputs["encoder_block_lens"][idx : idx + 1] = block_num
-            self.share_inputs["block_tables"][idx : idx + 1, :block_num] = np.arange(
-                idx * block_num, (idx + 1) * block_num, 1
-            )
+            if self.enable_head_wise_kv_cache:
+                # Head-wise dummy: fill block_tables_3d with cache_ids
+                if self.share_inputs.get("block_tables_3d") is None:
+                    max_num_seqs = self.share_inputs["block_tables"].shape[0]
+                    block_tables_2d = np.full(
+                        (max_num_seqs * self.kv_num_heads, block_num),
+                        -1,
+                        dtype=np.int32,
+                    )
+                    self.share_inputs["block_tables_3d"] = paddle.to_tensor(block_tables_2d, dtype="int32")
+
+                # Assign sequential cache_ids for this batch across heads
+                for head_id in range(self.kv_num_heads):
+                    flat_idx = idx * self.kv_num_heads + head_id
+                    start = flat_idx * block_num
+                    end = start + block_num
+                    self.share_inputs["block_tables_3d"][flat_idx : flat_idx + 1, :block_num] = np.arange(
+                        start, end, 1, dtype="int32"
+                    )
+                self.share_inputs["block_tables"][idx : idx + 1, :] = -1
+            else:
+                self.share_inputs["block_tables"][idx : idx + 1, :block_num] = np.arange(
+                    idx * block_num, (idx + 1) * block_num, 1
+                )
         self.share_inputs["seq_lens_this_time"] = self.seq_lens_this_time_buffer
 
     def _init_share_inputs(self, max_num_seqs: int):
@@ -1519,12 +1517,10 @@ class GPUModelRunner(ModelRunnerBase):
         ) // self.cache_config.block_size + self.cache_config.enc_dec_block_num
         self.share_inputs["block_tables"] = paddle.full([max_num_seqs, pre_max_block_num], -1, dtype="int32")
 
-        # Initialize head-wise block tables (for True cache_id-based architecture)
-        # block_tables_3d: [max_num_seqs][kv_num_heads][pre_max_block_num]
-        # block_lens: [max_num_seqs][kv_num_heads]
-        # These will be dynamically allocated when head-wise requests are processed
+        # Initialize head-wise block tables (for true cache_id-based architecture)
+        # block_tables_3d: flattened [batch*kv_num_heads, max_blocks_per_head]
+        # These will be dynamically allocated when head-wise requests are processed.
         self.share_inputs["block_tables_3d"] = None  # Will be set to numpy array
-        self.share_inputs["block_lens"] = None  # Will be set to numpy array
 
         # Initialize free list
         free_list = list(
@@ -1790,6 +1786,7 @@ class GPUModelRunner(ModelRunnerBase):
             cu_seqlens_q=self.share_inputs["cu_seqlens_q"],
             cu_seqlens_k=self.share_inputs["cu_seqlens_k"],
             block_tables=self.share_inputs["block_tables"],
+            block_tables_3d=self.share_inputs.get("block_tables_3d"),
             caches=self.share_inputs["caches"],
             encoder_batch_ids=self.share_inputs["encoder_batch_ids"],
             encoder_tile_ids_per_batch=self.share_inputs["encoder_tile_ids_per_batch"],

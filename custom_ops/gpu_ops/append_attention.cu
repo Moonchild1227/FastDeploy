@@ -507,15 +507,21 @@ std::vector<paddle::Tensor> AppendAttention(
     const int max_blocks_per_head = 0) {
   AppendAttnMetaData meta_data;
 
-  // Set head-wise KV cache parameters in meta_data
-  meta_data.use_head_wise = enable_head_wise_kv_cache;
-  meta_data.max_blocks_per_head = max_blocks_per_head;
-
   const auto& qkv_dims = qkv.dims();
   const auto& key_cache_dims = key_cache.dims();
+  const auto& block_table_dims = block_tables.dims();
+  const auto& seq_lens_dims = seq_lens_encoder.dims();
   meta_data.token_nums = qkv_dims[0];
-  meta_data.kv_num_heads = key_cache_dims[1];
-  meta_data.head_dims = key_cache_dims[3];
+  if (enable_head_wise_kv_cache) {
+    // Head-wise cache layout: [total_cache_ids, block_size, head_dim]
+    meta_data.head_dims = key_cache_dims[2];
+    int batch_size = seq_lens_dims[0];
+    meta_data.kv_num_heads = block_table_dims[0] / batch_size;
+  } else {
+    // Original cache layout: [block, kv_head, block_size, head_dim]
+    meta_data.kv_num_heads = key_cache_dims[1];
+    meta_data.head_dims = key_cache_dims[3];
+  }
   // TODO: trick method support c4, add attr head_dims in the future
   if (cache_quant_type_str == "cache_int4_zp") {
     meta_data.head_dims *= 2;
@@ -640,7 +646,9 @@ std::vector<paddle::Tensor> AppendAttention(
         speculate_max_draft_token_num,
         causal,
         speculate_decoder,
-        sliding_window);
+        sliding_window,
+        enable_head_wise_kv_cache,
+        max_blocks_per_head);
   };
 
   phi::dtype::float16 fp16_dtype;
@@ -723,15 +731,21 @@ std::vector<paddle::Tensor> AppendAttentionWithOutput(
     const int max_blocks_per_head = 0) {
   AppendAttnMetaData meta_data;
 
-  // Set head-wise KV cache parameters in meta_data
-  meta_data.use_head_wise = enable_head_wise_kv_cache;
-  meta_data.max_blocks_per_head = max_blocks_per_head;
-
   const auto& qkv_dims = qkv.dims();
   const auto& key_cache_dims = key_cache.dims();
+  const auto& block_table_dims = block_tables.dims();
+  const auto& seq_lens_dims = seq_lens_encoder.dims();
   meta_data.token_nums = qkv_dims[0];
-  meta_data.kv_num_heads = key_cache_dims[1];
-  meta_data.head_dims = key_cache_dims[3];
+  if (enable_head_wise_kv_cache) {
+    // Head-wise cache layout: [total_cache_ids, block_size, head_dim]
+    meta_data.head_dims = key_cache_dims[2];
+    int batch_size = seq_lens_dims[0];
+    meta_data.kv_num_heads = block_table_dims[0] / batch_size;
+  } else {
+    // Original cache layout: [block, kv_head, block_size, head_dim]
+    meta_data.kv_num_heads = key_cache_dims[1];
+    meta_data.head_dims = key_cache_dims[3];
+  }
   // TODO: trick method support c4, add attr head_dims in the future
   if (cache_quant_type_str == "cache_int4_zp") {
     meta_data.head_dims *= 2;
@@ -802,7 +816,9 @@ std::vector<paddle::Tensor> AppendAttentionWithOutput(
         speculate_max_draft_token_num,
         causal,
         speculate_decoder,
-        sliding_window);
+        sliding_window,
+        enable_head_wise_kv_cache,
+        max_blocks_per_head);
   };
 
   phi::dtype::float16 fp16_dtype;
@@ -1227,6 +1243,8 @@ PD_BUILD_STATIC_OP(append_attention_with_output)
         "causal: bool",
         "speculate_decoder: bool",
         "sliding_window: int",
+        "enable_head_wise_kv_cache: bool",
+        "max_blocks_per_head: int",
     })
     .SetKernelFn(PD_KERNEL(AppendAttentionWithOutput))
     .SetInferShapeFn(PD_INFER_SHAPE(AppendAttentionWithOutputInferShape))

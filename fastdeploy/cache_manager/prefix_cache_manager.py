@@ -32,7 +32,6 @@ from fastdeploy import envs
 from fastdeploy.cache_manager.cache_data import BlockNode, CacheStatus
 from fastdeploy.cache_manager.cache_metrics import CacheMetrics
 from fastdeploy.cache_manager.cache_tasks import ReadStorageTask, WriteStorageTask
-from fastdeploy.cache_manager.headwise_allocator import HeadWiseCacheAllocator
 from fastdeploy.cache_manager.ops import get_all_visible_devices
 from fastdeploy.config import FDConfig
 from fastdeploy.engine.request import Request
@@ -84,8 +83,10 @@ class PrefixCacheManager:
             1,
             int(config.model_config.num_key_value_heads) // config.parallel_config.tensor_parallel_size,
         )
+        if self.enable_head_wise_kv_cache:
+            # Head-wise mode uses logical block count from total_block_num.
+            self.num_gpu_blocks = self.cache_config.total_block_num
 
-        # P1: Head-wise mode currently only supports v0 scheduler path
         if self.enable_head_wise_kv_cache and envs.ENABLE_V1_KVCACHE_SCHEDULER:
             logger.warning(
                 "[HEAD_WISE] Head-wise KV cache mode is enabled but v1 scheduler is also enabled. "
@@ -94,32 +95,13 @@ class PrefixCacheManager:
             )
 
         if self.enable_head_wise_kv_cache:
-            # Head-wise mode with True cache_id-based architecture
-            # cache_id is completely free (not encoded with head info)
-            # Physical layout: [cache_id, block_size, head_dim] (real rearrangement, not a view)
+            # Head-wise mode with true cache_id-based architecture.
+            # cache_id is global (not encoded with head info).
+            # Physical layout: [cache_id, block_size, head_dim].
             self.total_cache_ids = self.num_gpu_blocks * self.kv_num_heads
-
-            # Use HeadWiseCacheAllocator for per-head cache management
-            self.cache_allocator = HeadWiseCacheAllocator(
-                total_cache_ids=self.total_cache_ids, kv_num_heads=self.kv_num_heads
-            )
-
-            # For backward compatibility, maintain gpu_free_block_list as view of allocator's free_list
-            # Note: This is only for metrics/monitoring, actual allocation uses cache_allocator
-            self.gpu_free_block_list = self.cache_allocator.free_list
-
-            logger.info(
-                f"[HEAD_WISE] PrefixCacheManager initialized with TRUE cache_id-based architecture. "
-                f"num_gpu_blocks={self.num_gpu_blocks}, kv_num_heads={self.kv_num_heads}, "
-                f"total_cache_ids={self.total_cache_ids}, "
-                f"cache_allocator={self.cache_allocator}, "
-                f"cache_config.total_block_num={self.cache_config.total_block_num}, "
-                f"cache_config.prefill_kvcache_block_num={self.cache_config.prefill_kvcache_block_num}, "
-                f"cache_config.kv_cache_ratio={getattr(self.cache_config, 'kv_cache_ratio', 'N/A')}"
-            )
+            self.gpu_free_block_list = list(range(self.total_cache_ids - 1, -1, -1))
         else:
             self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
-
         if self.num_cpu_blocks > 0:
             self.cpu_free_block_list = list(range(self.num_cpu_blocks - 1, -1, -1))
         else:
@@ -162,14 +144,17 @@ class PrefixCacheManager:
         self.free_gpu_executor_pool = ThreadPoolExecutor(max_workers=1)
         self.free_cpu_executor_pool = ThreadPoolExecutor(max_workers=1)
         self.gpu_free_task_future = None
+        self.cpu_free_future = None
         self.cache_status_lock = Lock()
 
         logger.info(
-            f"num_gpu_blocks_server_owned {self.num_gpu_blocks} num_cpu_blocks "
-            + f"{self.num_cpu_blocks}, bytes_per_layer_per_block {self.cache_config.bytes_per_layer_per_block}"
+            f"Prefix cache manager is initialized with {self.num_gpu_blocks} gpu blocks "
+            f"and {self.num_cpu_blocks} cpu blocks, bytes_per_token_per_layer for each rank: "
+            f"{self.cache_config.bytes_per_token_per_layer / self.config.parallel_config.tensor_parallel_size}"
         )
 
         main_process_metrics.max_gpu_block_num.set(self.num_gpu_blocks)
+        main_process_metrics.max_cpu_block_num.set(self.num_cpu_blocks)
         main_process_metrics.available_gpu_block_num.set(self.num_gpu_blocks)
         main_process_metrics.free_gpu_block_num.set(self.num_gpu_blocks)
         main_process_metrics.available_gpu_resource.set(1.0)
@@ -210,8 +195,6 @@ class PrefixCacheManager:
     @property
     def available_gpu_resource(self):
         if self.enable_head_wise_kv_cache:
-            # In head-wise mode, free_list contains cache_ids
-            # Need to convert to block count for meaningful resource ratio
             free_block_count = len(self.gpu_free_block_list) // self.kv_num_heads
             return free_block_count / self.num_gpu_blocks if self.num_gpu_blocks > 0 else 0.0
         return len(self.gpu_free_block_list) / self.num_gpu_blocks if self.num_gpu_blocks > 0 else 0.0
@@ -234,6 +217,22 @@ class PrefixCacheManager:
         self.shm_cache_task_flag_broadcast = IPCSignal(
             name="cache_task_broadcast_signal",
             array=broadcast_cache_task_flag_array,
+            dtype=np.int32,
+            suffix=engine_worker_queue_port,
+            create=True,
+        )
+
+        self.cache_task_is_paused_signal = IPCSignal(
+            name="cache_task_is_paused",
+            array=np.zeros([1], dtype=np.int32),
+            dtype=np.int32,
+            suffix=engine_worker_queue_port,
+            create=True,
+        )
+
+        self.cache_task_inflight_signal = IPCSignal(
+            name="cache_task_inflight",
+            array=np.zeros([tensor_parallel_size], dtype=np.int32),
             dtype=np.int32,
             suffix=engine_worker_queue_port,
             create=True,
@@ -382,7 +381,7 @@ class PrefixCacheManager:
         # Start additional threads
         if cache_config.kvcache_storage_backend or self.num_cpu_blocks > 0:
             logger.info("Enable hierarchical cache.")
-            threading.Thread(target=self.recv_data_transfer_result).start()
+            threading.Thread(target=self.recv_data_transfer_result, daemon=True).start()
         if cache_config.enable_prefix_caching:
             threading.Thread(target=self.clear_prefix_cache, daemon=True).start()
 
@@ -471,34 +470,24 @@ class PrefixCacheManager:
         """
         update cache config
         """
-        # Log before update for debugging
         old_num_gpu_blocks = self.num_gpu_blocks
         old_total_cache_ids = getattr(self, "total_cache_ids", None)
 
         self.cache_config = cache_config
-        if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+        if self.enable_head_wise_kv_cache:
             self.num_gpu_blocks = cache_config.total_block_num
-            logger.info(
-                f"[HEAD_WISE] update_cache_config: using total_block_num={cache_config.total_block_num} "
-                f"(ENABLE_V1_KVCACHE_SCHEDULER=1)"
-            )
         else:
-            self.num_gpu_blocks = cache_config.prefill_kvcache_block_num
-            logger.info(
-                f"[HEAD_WISE] update_cache_config: using prefill_kvcache_block_num={cache_config.prefill_kvcache_block_num} "
-                f"(ENABLE_V1_KVCACHE_SCHEDULER=0)"
-            )
+            if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+                self.num_gpu_blocks = cache_config.total_block_num
+            else:
+                self.num_gpu_blocks = cache_config.prefill_kvcache_block_num
 
-        # In head-wise mode, free_list should be cache_ids
         if self.enable_head_wise_kv_cache:
             self.total_cache_ids = self.num_gpu_blocks * self.kv_num_heads
             self.gpu_free_block_list = list(range(self.total_cache_ids - 1, -1, -1))
             logger.info(
-                f"[HEAD_WISE] update_cache_config: num_gpu_blocks changed from {old_num_gpu_blocks} to {self.num_gpu_blocks}, "
-                f"total_cache_ids changed from {old_total_cache_ids} to {self.total_cache_ids}, "
-                f"kv_num_heads={self.kv_num_heads}, "
-                f"kv_cache_ratio={getattr(cache_config, 'kv_cache_ratio', 'N/A')}, "
-                f"gpu_memory_utilization={getattr(cache_config, 'gpu_memory_utilization', 'N/A')}"
+                f"[HEAD_WISE] update_cache_config: num_gpu_blocks {old_num_gpu_blocks} -> {self.num_gpu_blocks}, "
+                f"total_cache_ids {old_total_cache_ids} -> {self.total_cache_ids}"
             )
         else:
             self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
@@ -510,8 +499,8 @@ class PrefixCacheManager:
         self.node_id_pool = list(range(self.num_gpu_blocks + self.num_cpu_blocks))
 
         main_process_metrics.max_gpu_block_num.set(self.num_gpu_blocks)
+        main_process_metrics.max_cpu_block_num.set(self.num_cpu_blocks)
         main_process_metrics.available_gpu_block_num.set(self.num_gpu_blocks)
-        # In head-wise mode, report block count not cache_id count
         free_block_count = len(self.gpu_free_block_list)
         if self.enable_head_wise_kv_cache:
             free_block_count = free_block_count // self.kv_num_heads
@@ -522,7 +511,6 @@ class PrefixCacheManager:
         """
         Check if num_blocks gpu blocks can be allocated.
         """
-        # In head-wise mode, check at block level
         available_blocks = len(self.gpu_free_block_list)
         if self.enable_head_wise_kv_cache:
             available_blocks = available_blocks // self.kv_num_heads
@@ -530,7 +518,6 @@ class PrefixCacheManager:
         if available_blocks < num_blocks:
             if self.cache_config.enable_prefix_caching:
                 self.free_block_ids(num_blocks)
-            # Re-check after freeing
             available_blocks = len(self.gpu_free_block_list)
             if self.enable_head_wise_kv_cache:
                 available_blocks = available_blocks // self.kv_num_heads
@@ -544,21 +531,15 @@ class PrefixCacheManager:
     def allocate_gpu_blocks(self, num_blocks, req_id=None):
         """
         allocate gpu blocks.
-
-        When head-wise mode is enabled:
-        - Returns 2D cache_ids: List[List[int]] where cache_ids[head_id][block_idx] = cache_id
-        - cache_id = block_id * kv_num_heads + head_id
-        - All heads of the same block are allocated together to ensure kernel compatibility
         """
         if self.enable_head_wise_kv_cache:
             return self._allocate_gpu_blocks_head_wise(num_blocks, req_id)
 
-        # Original behavior: return 1D block_ids
         assert num_blocks <= len(
             self.gpu_free_block_list
         ), f"gpu free block num: {len(self.gpu_free_block_list)} < needed number {num_blocks}"
         logger.debug(f"{req_id} start allocate...")
-        allocated_block_ids = [heapq.heappop(self.gpu_free_block_list) for _ in range(num_blocks)]
+        allocated_block_ids = [heapq.heappop(self.gpu_free_block_list) for i in range(num_blocks)]
         logger.info(
             f"req_id:{req_id} allocate_gpu_blocks: {allocated_block_ids}, len(self.gpu_free_block_list) {len(self.gpu_free_block_list)}"
         )
@@ -568,62 +549,35 @@ class PrefixCacheManager:
 
     def _allocate_gpu_blocks_head_wise(self, num_blocks, req_id=None):
         """
-        Allocate GPU blocks in head-wise mode with True cache_id-based architecture.
+        Allocate cache_ids for head-wise mode.
 
-        NEW ARCHITECTURE (True cache_id-based):
-        - cache_id is completely free (not encoded with head info)
-        - Each head independently allocates cache_id from shared free_list
-        - Returns 2D cache_ids: [[head_0_cache_ids], [head_1_cache_ids], ...]
-        - Supports unequal head lengths for head-wise SWA
-
-        Args:
-            num_blocks: Number of blocks to allocate (per head, all equal for now)
-            req_id: Request ID for logging
-
-        Returns:
-            List[List[int]]: 2D cache_ids with shape [kv_num_heads][num_blocks]
-            Each head gets its own independent cache_ids
+        Returns 2D cache_ids: List[List[int]] with shape [kv_num_heads][num_blocks].
         """
-        # All heads get the same number of blocks (equal allocation)
-        # For unequal allocation (future work), pass list of blocks per head
-        num_blocks_per_head = [num_blocks] * self.kv_num_heads
+        total_needed = num_blocks * self.kv_num_heads
+        assert total_needed <= len(
+            self.gpu_free_block_list
+        ), f"gpu free cache_id num: {len(self.gpu_free_block_list)} < needed number {total_needed}"
+        logger.debug(f"{req_id} start allocate head-wise cache_ids...")
 
-        # Use HeadWiseCacheAllocator to allocate
-        cache_ids_2d = self.cache_allocator.allocate_per_head(num_blocks_per_head)
+        allocated_cache_ids = [heapq.heappop(self.gpu_free_block_list) for _ in range(total_needed)]
+        cache_ids_2d = []
+        for head_id in range(self.kv_num_heads):
+            start = head_id * num_blocks
+            end = start + num_blocks
+            cache_ids_2d.append(allocated_cache_ids[start:end])
 
-        # Format cache_ids for logging
-        cache_ids_preview = []
-        for head_id, head_cache_ids in enumerate(cache_ids_2d):
-            preview = head_cache_ids[:3] if len(head_cache_ids) > 3 else head_cache_ids
-            cache_ids_preview.append(f"head{head_id}:{preview}{'...' if len(head_cache_ids) > 3 else ''}")
-
-        logger.info(
-            f"[HEAD_WISE] req_id:{req_id} allocated {num_blocks} blocks per head, "
-            f"total {sum(num_blocks_per_head)} cache_ids, "
-            f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0])}], "
-            f"cache_ids: [{', '.join(cache_ids_preview)}], "
-            f"remaining free cache_ids: {len(self.cache_allocator.free_list)}, "
-            f"allocator stats: {self.cache_allocator.get_stats()}"
-        )
-
-        # Update metrics (free_list is managed by allocator now)
-        main_process_metrics.free_gpu_block_num.set(len(self.gpu_free_block_list) // self.kv_num_heads)
+        free_block_count = len(self.gpu_free_block_list) // self.kv_num_heads
+        main_process_metrics.free_gpu_block_num.set(free_block_count)
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
-
         return cache_ids_2d
 
     def recycle_gpu_blocks(self, gpu_block_ids, req_id=None):
         """
         recycle gpu blocks.
-
-        When head-wise mode is enabled:
-        - Accepts 2D cache_ids: List[List[int]]
-        - All cache_ids are pushed back to free_list
         """
         if self.enable_head_wise_kv_cache:
             return self._recycle_gpu_blocks_head_wise(gpu_block_ids, req_id)
 
-        # Original behavior: accept 1D block_ids
         logger.info(
             f"req_id:{req_id} recycle_gpu_blocks: {gpu_block_ids}, len(self.gpu_free_block_list) {len(self.gpu_free_block_list)}"
         )
@@ -638,44 +592,21 @@ class PrefixCacheManager:
 
     def _recycle_gpu_blocks_head_wise(self, cache_ids_2d, req_id=None):
         """
-        Recycle GPU blocks in head-wise mode with True cache_id-based architecture.
-
-        NEW ARCHITECTURE (True cache_id-based):
-        - cache_ids_2d: 2D list of cache IDs to recycle
-        - Each head's cache_ids are independently recycled to shared free_list
-        - Supports unequal head lengths
-
-        Args:
-            cache_ids_2d: List[List[int]] with shape [kv_num_heads][num_blocks]
-            req_id: Request ID for logging
+        Recycle cache_ids for head-wise mode.
         """
-        # Format cache_ids for logging
-        cache_ids_preview = []
-        for head_id, head_cache_ids in enumerate(cache_ids_2d):
-            if head_cache_ids:
-                preview = head_cache_ids[:3] if len(head_cache_ids) > 3 else head_cache_ids
-                cache_ids_preview.append(f"head{head_id}:{preview}{'...' if len(head_cache_ids) > 3 else ''}")
-
         logger.info(
-            f"[HEAD_WISE] req_id:{req_id} recycling cache_ids, "
-            f"shape=[{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d and cache_ids_2d[0] else 0}], "
-            f"cache_ids: [{', '.join(cache_ids_preview)}], "
-            f"free_list before: {len(self.gpu_free_block_list)}"
+            f"req_id:{req_id} recycle head-wise cache_ids, len(self.gpu_free_block_list) {len(self.gpu_free_block_list)}"
         )
-
-        # Use HeadWiseCacheAllocator to recycle
-        self.cache_allocator.recycle(cache_ids_2d)
-
-        # Update metrics
+        if isinstance(cache_ids_2d, list):
+            for head_ids in cache_ids_2d:
+                for cache_id in head_ids:
+                    heapq.heappush(self.gpu_free_block_list, cache_id)
+        else:
+            heapq.heappush(self.gpu_free_block_list, cache_ids_2d)
+        logger.debug(f"req_id:{req_id} recycle head-wise cache_ids end")
         free_block_count = len(self.gpu_free_block_list) // self.kv_num_heads
         main_process_metrics.free_gpu_block_num.set(free_block_count)
         main_process_metrics.available_gpu_resource.set(self.available_gpu_resource)
-
-        logger.info(
-            f"[HEAD_WISE] req_id:{req_id} recycled, "
-            f"free_list after: {len(self.gpu_free_block_list)}, "
-            f"allocator stats: {self.cache_allocator.get_stats()}"
-        )
 
     def allocate_cpu_blocks(self, num_blocks):
         """
@@ -734,19 +665,19 @@ class PrefixCacheManager:
         """
         sync swap task
         """
-        self.task_swapping_event[transfer_task_id].wait()
+        while True:
+            flag = self.task_swapping_event[transfer_task_id].wait(timeout=0.1)
+            if flag or self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                if not flag:
+                    logger.info(f"swap task timeout because prefix tree status is not normal: {transfer_task_id}")
+                break
         del self.task_swapping_event[transfer_task_id]
 
     def _check_validity(self, req_id, match_gpu_blocks_num, expected_block_num):
         """
         check enough gpu memory to allocate cache
         """
-        # In head-wise mode, check at block level
-        available_blocks = len(self.gpu_free_block_list)
-        if self.enable_head_wise_kv_cache:
-            available_blocks = available_blocks // self.kv_num_heads
-
-        if expected_block_num - match_gpu_blocks_num > available_blocks:
+        if expected_block_num - match_gpu_blocks_num > len(self.gpu_free_block_list):
             msg = (
                 f"request_block_ids: request block for req_id {req_id} failed. "
                 + f"matched gpu block num: {match_gpu_blocks_num} require extra gpu block num: "
@@ -866,8 +797,13 @@ class PrefixCacheManager:
                 self.req_to_radix_tree_info[req_id] = [leaf_node, can_cache_computed_tokens]
                 task.num_cached_blocks = can_cache_computed_tokens // block_size
         except Exception as e:
-            logger.error(f"update_cache_blocks, error: {type(e)} {e}, {str(traceback.format_exc())}")
-            raise e
+            if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                logger.warning(
+                    f"update_cache_blocks: an error occured while prefix tree status is not normal, ignore it. {e}"
+                )
+            else:
+                logger.error(f"update_cache_blocks, error: {type(e)} {e}, {str(traceback.format_exc())}")
+                raise e
 
     def is_chunked_mm_input(self, mm_inputs, matched_token_num):
         """
@@ -1049,8 +985,13 @@ class PrefixCacheManager:
                 task.num_cached_blocks = len(common_block_ids)
                 return common_block_ids, match_token_num, metrics
             except Exception as e:
-                logger.error(f"request_match_blocks: request_block_ids: error: {type(e)} {e}")
-                raise e
+                if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                    logger.warning(
+                        f"request_match_blocks: an error occured while prefix tree status is not normal, ignore it. {e}"
+                    )
+                else:
+                    logger.error(f"request_match_blocks: request_block_ids: error: {type(e)} {e}")
+                    raise e
 
     def request_block_ids(self, task, block_size, dec_token_num, *args):
         """
@@ -1151,8 +1092,13 @@ class PrefixCacheManager:
                 )
                 return common_block_ids, unique_block_ids, hit_info
             except Exception as e:
-                logger.error(f"request_block_ids: error: {type(e)} {e}, {str(traceback.format_exc())}")
-                raise e
+                if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                    logger.warning(
+                        f"request_block_ids: an error occured while prefix tree status is not normal, ignore it. {e}"
+                    )
+                else:
+                    logger.error(f"request_block_ids: error: {type(e)} {e}, {str(traceback.format_exc())}")
+                    raise e
 
     def release_block_ids_async(self, task):
         """
@@ -1207,8 +1153,13 @@ class PrefixCacheManager:
                 )
                 return
             except Exception as e:
-                logger.error(f"release_block_ids: error: {type(e)} {e}, {str(traceback.format_exc())}")
-                raise e
+                if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                    logger.warning(
+                        f"release_block_ids: an error occured while prefix tree status is not normal, ignore it. {e}"
+                    )
+                else:
+                    logger.error(f"release_block_ids: error: {type(e)} {e}, {str(traceback.format_exc())}")
+                    raise e
 
     def write_cache_to_storage(self, request: Request):
         """
@@ -1332,8 +1283,13 @@ class PrefixCacheManager:
                     else:
                         break
             except Exception as e:
-                logger.error(f"free_nodes_directly: error: {type(e)} {e}")
-                raise e
+                if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                    logger.warning(
+                        f"free_nodes_directly: an error occured while prefix tree status is not normal, ignore it. {e}"
+                    )
+                else:
+                    logger.error(f"free_nodes_directly: error: {type(e)} {e}")
+                    raise e
 
     def _handle_free_gpu_node_without_cpu(self, node):
         """
@@ -1504,15 +1460,17 @@ class PrefixCacheManager:
 
                 # swap cache to cpu
                 if hash_value_gpu_block_ids_map:
-                    cpu_free_future = None
+                    self.cpu_free_future = None
                     if total_gpu_free_count > len(self.cpu_free_block_list):
                         cpu_free_count = total_gpu_free_count
                         if cpu_free_count < need_block_num:
                             cpu_free_count = need_block_num
-                        cpu_free_future = self.free_cpu_executor_pool.submit(self.free_cpu_block_ids, cpu_free_count)
+                        self.cpu_free_future = self.free_cpu_executor_pool.submit(
+                            self.free_cpu_block_ids, cpu_free_count
+                        )
                     self.gpu_free_task_future = self.free_gpu_executor_pool.submit(
                         self._evict_cache_async,
-                        cpu_free_future,
+                        self.cpu_free_future,
                         total_gpu_free_count,
                         hash_value_gpu_block_ids_map,
                         hash_value_block_ids_map,
@@ -1523,8 +1481,13 @@ class PrefixCacheManager:
                 else:
                     self.gpu_free_task_future = None
             except Exception as e:
-                logger.error(f"free_block_ids_async: error: {type(e)} {e}, {str(traceback.format_exc())}")
-                raise e
+                if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                    logger.warning(
+                        f"free_block_ids_async: an error occured while prefix tree status is not normal, ignore it. {e}"
+                    )
+                else:
+                    logger.error(f"free_block_ids_async: error: {type(e)} {e}, {str(traceback.format_exc())}")
+                    raise e
 
     def free_cpu_block_ids(self, need_block_num):
         """
@@ -1838,6 +1801,96 @@ class PrefixCacheManager:
             node.req_id_set.add(req_id)
             node = node.parent
 
+    def cache_output_blocks(self, task, block_size):
+        """
+        Cache blocks already computed.
+        """
+        try:
+            with self.request_release_lock:
+                req_id = task.request_id
+                logger.info(f"Cache output tokens for task {req_id}")
+                last_node, num_cached_tokens = self.req_to_radix_tree_info[req_id]
+                if req_id in self.leaf_req_map[last_node]:  # delete old leaf record, update later
+                    self.leaf_req_map[last_node].remove(req_id)
+                if isinstance(task.prompt_token_ids, np.ndarray):
+                    prompt_token_ids = task.prompt_token_ids.tolist()
+                else:
+                    prompt_token_ids = task.prompt_token_ids
+                input_ids = prompt_token_ids + task.output_token_ids
+                total_token_num = len(input_ids)
+                can_cache_computed_tokens = total_token_num - total_token_num % block_size
+                current_match_node = last_node
+                has_modified_gpu_lru_leaf_heap = False
+                has_modified_cpu_lru_leaf_heap = False
+                can_recycle_gpu_block_ids = []
+                can_recycle_cpu_block_ids = []
+                gpu_block_ids_to_cache = task.block_tables[num_cached_tokens // block_size :].copy()
+                current_time = time.time()
+                prefix_block_key = [] if last_node.hash_value is None else [last_node.hash_value]
+
+                with self.cache_status_lock:
+                    while num_cached_tokens < total_token_num:
+                        token_block = input_ids[num_cached_tokens : num_cached_tokens + block_size]
+                        token_num = len(token_block)
+                        if token_num != block_size:
+                            break
+                        hash_value = get_hash_str(token_block, prefix_block_key)
+                        prefix_block_key = [hash_value]
+                        if hash_value in current_match_node.children:
+                            child = current_match_node.children[hash_value]
+                            child.increment_shared_count()
+                            child.last_used_time = current_time
+                            child.req_id_set.add(req_id)
+                            if child in self.gpu_lru_leaf_set:
+                                self.gpu_lru_leaf_set.remove(child)
+                                self.gpu_lru_leaf_heap.remove(child)
+                                has_modified_gpu_lru_leaf_heap = True
+                            elif child in self.cpu_lru_leaf_set:
+                                self.cpu_lru_leaf_set.remove(child)
+                                self.cpu_lru_leaf_heap.remove(child)
+                                has_modified_cpu_lru_leaf_heap = True
+                            if child.has_in_gpu:
+                                can_recycle_gpu_block_ids.append(gpu_block_ids_to_cache.pop(0))
+                            else:
+                                if child.cache_status == CacheStatus.SWAP2CPU:
+                                    logger.info(
+                                        f"cache_output_blocks: req_id {task.request_id} matched node"
+                                        + f" {child.node_id} which is being SWAP2CPU"
+                                    )
+                                    child.cache_status = CacheStatus.GPU
+                                    can_recycle_gpu_block_ids.append(gpu_block_ids_to_cache.pop(0))
+                                elif child.cache_status == CacheStatus.CPU:
+                                    can_recycle_cpu_block_ids.append(child.block_id)
+                                    child.cache_status = CacheStatus.GPU
+                                    gpu_block_id = gpu_block_ids_to_cache.pop(0)
+                                    child.block_id = gpu_block_id
+                            num_cached_tokens = num_cached_tokens + block_size
+                            current_match_node = child
+                        else:
+                            break
+
+                if has_modified_gpu_lru_leaf_heap:
+                    heapq.heapify(self.gpu_lru_leaf_heap)
+                if has_modified_cpu_lru_leaf_heap:
+                    heapq.heapify(self.cpu_lru_leaf_heap)
+                self.recycle_gpu_blocks(can_recycle_gpu_block_ids)
+                self.recycle_cpu_blocks(can_recycle_cpu_block_ids)
+
+                leaf_node = self.mm_build_path(
+                    request=task,
+                    num_computed_tokens=can_cache_computed_tokens,
+                    block_size=block_size,
+                    last_node=current_match_node,
+                    num_cached_tokens=num_cached_tokens,
+                )
+                self.req_leaf_map[req_id] = leaf_node
+                self.leaf_req_map[leaf_node].add(req_id)
+                self.req_to_radix_tree_info[req_id] = (leaf_node, can_cache_computed_tokens)
+                task.num_cached_blocks = can_cache_computed_tokens // block_size
+        except Exception as e:
+            logger.error(f"cache_output_blocks, error: {type(e)} {e}, {str(traceback.format_exc())}")
+            raise e
+
     def mm_build_path(self, request, num_computed_tokens, block_size, last_node, num_cached_tokens):
         """
         Constructs a caching path in radix tree for multimodal requests by processing computed tokens.
@@ -2106,25 +2159,40 @@ class PrefixCacheManager:
                         + f"task_cpu_block_id {task_cpu_block_id} event_type {event_type} done"
                     )
             except Exception as e:
-                logger.warning(f"recv_data_transfer_result: error: {e}, {str(traceback.format_exc())}")
-                raise e
+                if self.prefix_tree_status_signal.value[0] != PrefixTreeStatus.NORMAL:
+                    logger.warning(
+                        f"recv_data_transfer_result: an error occured while prefix tree status is not normal, ignore it. {e}"
+                    )
+                else:
+                    logger.error(f"recv_data_transfer_result: {str(traceback.format_exc())}")
+                    raise e
 
     def reset(self):
         """
         Reset the RadixTree.
         """
+        logger.info(f"wait for cache_task_inflight_signal to reset {self.cache_task_inflight_signal.value}")
+        while np.sum(self.cache_task_inflight_signal.value) != 0:
+            time.sleep(0.1)
 
-        if len(self.node_map) == 0:
-            return
+        logger.info("wait for recv_data_transfer_result done")
+        while not self.cache_task_queue.result_queue_empty():
+            time.sleep(0.1)
 
-        logger.info("Resetting the RadixTree!")
+        logger.info(f"Resetting the RadixTree! node_map len {len(self.node_map)}")
 
-        # wait for swap tasks to finish
+        logger.info("waiting for cpu_free_future to finish")
+        if self.cpu_free_future is not None:
+            self.cpu_free_future.result()
+        self.cpu_free_future = None
+        logger.info("reset cpu_free_future")
+
+        logger.info("waiting for gpu_free_task_future to finish")
         if self.gpu_free_task_future is not None:
             self.gpu_free_task_future.result()
-            self.gpu_free_task_future = None
-        for event in list(self.task_swapping_event.values()):
-            event.wait()
+        self.gpu_free_task_future = None
+        logger.info("reset gpu_free_task_future")
+
         self.task_swapping_event.clear()
 
         # clear node map

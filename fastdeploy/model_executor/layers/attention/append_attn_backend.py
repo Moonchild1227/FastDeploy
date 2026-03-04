@@ -45,9 +45,6 @@ from fastdeploy.model_executor.layers.attention.base_attention_backend import (
 )
 from fastdeploy.model_executor.layers.attention.utils import init_rank_and_device_id
 from fastdeploy.platforms import current_platform
-from fastdeploy.utils import get_logger
-
-logger = get_logger("append_attn_backend", "append_attn_backend.log")
 
 
 @dataclass
@@ -119,6 +116,7 @@ class AppendAttentionBackend(AttentionBackend):
 
     __infer_dynamic_dims_fields__ = ["attention_metadata"]
     attention_metadata: AppendAttentionMetadata
+    enable_ids_reorder: bool = envs.FD_PD_REORDER
 
     def __init__(
         self,
@@ -189,11 +187,6 @@ class AppendAttentionBackend(AttentionBackend):
 
         # Head-wise KV cache management
         self.enable_head_wise_kv_cache = envs.FD_HEAD_WISE_KV_CACHE == 1
-        if self.enable_head_wise_kv_cache:
-            logger.info(
-                f"[HEAD_WISE] AppendAttentionBackend initialized with head-wise KV cache. "
-                f"kv_num_heads={self.kv_num_heads}, block_size={self.block_size}, head_dim={self.head_dim}"
-            )
 
     def init_attention_metadata(self, forward_meta: ForwardMeta):
         """Initialize attntion metadata hence all layers in the forward pass can reuse it."""
@@ -226,8 +219,8 @@ class AppendAttentionBackend(AttentionBackend):
 
         self.attention_metadata: AttentionMetadata = metadata
 
-    def get_attntion_meta(self) -> AttentionMetadata:
-        """get_attntion_meta"""
+    def get_attention_meta(self) -> AttentionMetadata:
+        """get_attention_meta"""
         return self.attention_metadata
 
     def _get_identity_rotary_embs(self, original_rotary_embs: paddle.Tensor) -> paddle.Tensor:
@@ -265,22 +258,15 @@ class AppendAttentionBackend(AttentionBackend):
 
         When head-wise KV cache is enabled (FD_HEAD_WISE_KV_CACHE=1):
         - Returns shape [max_num_blocks * kv_num_heads, block_size, head_dim]
-        - This is a reshape view of the original [block, head, token, dim] layout
-        - Physical memory layout is unchanged, just viewed differently
+        - Cache is allocated in this layout (cache_id as first dim)
 
         When disabled (default):
         - Returns shape [max_num_blocks, kv_num_heads, block_size, head_dim]
         """
         if self.enable_head_wise_kv_cache:
-            # True cache_id-based architecture
-            # Physical layout: [total_cache_ids, block_size, head_dim]
-            # where total_cache_ids = max_num_blocks * kv_num_heads
-            # This is NOT a view reshape - this is the physical memory layout
+            # Cache_id-based layout: [total_cache_ids, block_size, head_dim]
+            # total_cache_ids = max_num_blocks * kv_num_heads
             key_cache_shape = [max_num_blocks * self.kv_num_heads, self.block_size, self.head_dim]
-            logger.info(
-                f"[HEAD_WISE] get_kv_cache_shape: True cache_id-based architecture. "
-                f"Physical layout: {key_cache_shape} (original would be [{max_num_blocks}, {self.kv_num_heads}, {self.block_size}, {self.head_dim}])"
-            )
         else:
             # Original: [block, head, token, dim]
             key_cache_shape = [max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim]
@@ -313,6 +299,10 @@ class AppendAttentionBackend(AttentionBackend):
 
         sliding_window = layer.sliding_window
 
+        norm_after_rope_in_kernel = not getattr(layer, "qk_norm_before_rope", False)
+        q_norm_weight = getattr(layer, "q_norm_weight", None) if norm_after_rope_in_kernel else None
+        k_norm_weight = getattr(layer, "k_norm_weight", None) if norm_after_rope_in_kernel else None
+
         if self.rope_3d:
             assert len(forward_meta.rotary_embs.shape) == 6
         else:
@@ -341,47 +331,9 @@ class AppendAttentionBackend(AttentionBackend):
             cache_k_scales = getattr(layer, "cache_k_scale", None)
             cache_v_scales = getattr(layer, "cache_v_scale", None)
 
-        # Head-wise KV cache: prepare cache and block_tables for True cache_id-based architecture
-        if self.enable_head_wise_kv_cache and forward_meta.enable_head_wise_kv_cache:
-            # True cache_id-based architecture
-            # Cache layout: [total_cache_ids, block_size, head_dim] where total_cache_ids = max_num_blocks * kv_num_heads
-            # block_tables_3d: [batch_size, kv_num_heads, max_blocks_per_head] stores cache_id directly
-
-            if layer.layer_id == 0:
-                # Calculate max_blocks_per_head from block_tables_3d shape
-                max_blocks_per_head = 0
-                if forward_meta.block_tables_3d is not None:
-                    # block_tables_3d shape: [batch*kv_heads, max_blocks_per_head]
-                    max_blocks_per_head = forward_meta.block_tables_3d.shape[1]
-
-                logger.info(
-                    f"[HEAD_WISE] forward_mixed: using True cache_id-based architecture, "
-                    f"cache_k.shape={cache_k.shape}, "
-                    f"block_tables_3d.shape={forward_meta.block_tables_3d.shape if forward_meta.block_tables_3d is not None else None}, "
-                    f"block_lens.shape={forward_meta.block_lens.shape if forward_meta.block_lens is not None else None}, "
-                    f"max_blocks_per_head={max_blocks_per_head}"
-                )
-            # Cache layout is already correct: [total_cache_ids, block_size, head_dim]
-            # No reshape needed
-
-            # Set sliding_window to special value to signal head-wise mode to kernel
-            # This triggers USE_HEAD_WISE=true path in kernel
-            sliding_window = -1  # Special value to indicate head-wise mode
-        elif self.enable_head_wise_kv_cache:
-            # View-based head-wise (legacy, for backward compatibility)
-            original_shape = cache_k.shape
-            max_num_blocks = original_shape[0] // self.kv_num_heads
-            actual_head_dim = original_shape[-1]
-            target_shape = [max_num_blocks, self.kv_num_heads, self.block_size, actual_head_dim]
-
-            cache_k = cache_k.reshape(target_shape)
-            cache_v = cache_v.reshape(target_shape)
-
-            if layer.layer_id == 0:
-                logger.info(
-                    f"[HEAD_WISE] forward_mixed: reshape cache from {original_shape} to {target_shape} for kernel "
-                    f"(actual_head_dim={actual_head_dim}, self.head_dim={self.head_dim})"
-                )
+        # Head-wise KV cache: prepare cache and block_tables for cache_id-based architecture
+        headwise_enabled = self.enable_head_wise_kv_cache and forward_meta.block_tables_3d is not None
+        max_blocks_per_head = forward_meta.block_tables_3d.shape[1] if headwise_enabled else 0
 
         if layer.layer_id == 0:
             # print(forward_meta.seq_lens_this_time)
@@ -406,6 +358,8 @@ class AppendAttentionBackend(AttentionBackend):
                 self.group_size,
                 self.block_size,
             )
+
+        block_tables_for_kernel = forward_meta.block_tables_3d if headwise_enabled else forward_meta.block_tables
 
         if self.use_output:
             quant_max_bound = getattr(layer, "quant_max_bound", 0.0)
@@ -451,7 +405,7 @@ class AppendAttentionBackend(AttentionBackend):
                 forward_meta.seq_lens_this_time,
                 forward_meta.batch_id_per_token,
                 forward_meta.cu_seqlens_q,
-                forward_meta.block_tables,
+                block_tables_for_kernel,
                 forward_meta.encoder_batch_ids,
                 forward_meta.encoder_tile_ids_per_batch,
                 forward_meta.encoder_num_blocks_x_cpu,
@@ -477,8 +431,8 @@ class AppendAttentionBackend(AttentionBackend):
                 layer.linear_smooth,
                 forward_meta.attn_mask_offsets,
                 metadata.kv_signal_data_list[layer.layer_id],
-                getattr(layer, "q_norm_weight", None),
-                getattr(layer, "k_norm_weight", None),
+                q_norm_weight,
+                k_norm_weight,
                 getattr(layer, "sinks", None),
                 getattr(layer, "rms_norm_eps", 1e-6),
                 metadata._fuse_kernel_compute_dtype,
@@ -497,12 +451,8 @@ class AppendAttentionBackend(AttentionBackend):
                 self.causal,
                 self.speculative_method is not None,
                 sliding_window,
-                self.enable_head_wise_kv_cache and forward_meta.enable_head_wise_kv_cache,
-                (
-                    forward_meta.block_tables_3d.shape[1]
-                    if (self.enable_head_wise_kv_cache and forward_meta.block_tables_3d is not None)
-                    else 0
-                ),
+                headwise_enabled,
+                max_blocks_per_head,
             )
         else:
             res = append_attention(
@@ -514,7 +464,7 @@ class AppendAttentionBackend(AttentionBackend):
                 forward_meta.seq_lens_this_time,
                 forward_meta.batch_id_per_token,
                 forward_meta.cu_seqlens_q,
-                forward_meta.block_tables,
+                block_tables_for_kernel,
                 forward_meta.encoder_batch_ids,
                 forward_meta.encoder_tile_ids_per_batch,
                 forward_meta.encoder_num_blocks_x_cpu,
@@ -539,8 +489,8 @@ class AppendAttentionBackend(AttentionBackend):
                 layer.linear_smooth,
                 forward_meta.attn_mask_offsets,
                 metadata.kv_signal_data_list[layer.layer_id],
-                getattr(layer, "q_norm_weight", None),
-                getattr(layer, "k_norm_weight", None),
+                q_norm_weight,
+                k_norm_weight,
                 getattr(layer, "sinks", None),
                 getattr(layer, "rms_norm_eps", 1e-6),
                 metadata._fuse_kernel_compute_dtype,
@@ -559,11 +509,7 @@ class AppendAttentionBackend(AttentionBackend):
                 self.causal,
                 self.speculative_method is not None,
                 sliding_window,
-                self.enable_head_wise_kv_cache and forward_meta.enable_head_wise_kv_cache,
-                (
-                    forward_meta.block_tables_3d.shape[1]
-                    if (self.enable_head_wise_kv_cache and forward_meta.block_tables_3d is not None)
-                    else 0
-                ),
+                headwise_enabled,
+                max_blocks_per_head,
             )
         return res

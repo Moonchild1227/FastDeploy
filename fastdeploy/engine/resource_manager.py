@@ -71,6 +71,10 @@ class ResourceManager:
             llm_logger.info(
                 f"[HEAD_WISE] ResourceManager initialized with head-wise mode. " f"kv_num_heads={self.kv_num_heads}"
             )
+            if self.enable_prefix_cache:
+                raise NotImplementedError("Head-wise KV cache does not support prefix caching yet.")
+            if getattr(config.cache_config, "enable_chunked_prefill", False):
+                raise NotImplementedError("Head-wise KV cache does not support chunked prefill yet.")
 
         llm_logger.info(f"{self.info()}")
         main_process_metrics.max_batch_size.set(max_num_seqs)
@@ -190,9 +194,7 @@ class ResourceManager:
             else:
                 block_tables = task.block_tables
 
-            # Handle head-wise mode
-            if self.enable_head_wise_kv_cache and task.is_head_wise:
-                # block_tables is 2D cache_ids
+            if self.enable_head_wise_kv_cache:
                 cache_ids_2d = block_tables
                 ori_number = self.available_block_num()
                 self.cache_manager.recycle_gpu_blocks(cache_ids_2d, req_id)
@@ -203,7 +205,6 @@ class ResourceManager:
                     f"cache_ids_2d shape: [{len(cache_ids_2d)}][{len(cache_ids_2d[0]) if cache_ids_2d else 0}]"
                 )
             else:
-                # Original behavior: block_tables is 1D block_ids
                 ori_number = self.available_block_num()
                 self.cache_manager.recycle_gpu_blocks(block_tables, req_id)
                 cur_number = self.available_block_num()
@@ -226,6 +227,8 @@ class ResourceManager:
         Returns:
             int: available block size
         """
+        if self.enable_head_wise_kv_cache:
+            return len(self.cache_manager.gpu_free_block_list) // self.kv_num_heads
         return len(self.cache_manager.gpu_free_block_list)
 
     def is_resource_sufficient(self, input_token_num):
@@ -319,35 +322,17 @@ class ResourceManager:
                     else:
                         task.block_tables = block_tables
 
-                    # Mark head-wise mode on task
                     if self.enable_head_wise_kv_cache:
-                        task.is_head_wise = True
-                        llm_logger.info(
-                            f"[HEAD_WISE] task {task.request_id} marked as head-wise, "
-                            f"block_tables shape: [{len(block_tables)}][{len(block_tables[0]) if block_tables else 0}]"
-                        )
-                    else:
-                        task.is_head_wise = False
+                        task.block_tables_3d = block_tables
 
                     task.need_block_tables = task.block_tables
                     # 2. if prefill/decode disaggregation is enabled
                     if task.disaggregate_info is not None:
-                        # P2: In head-wise mode, disaggregate paths expect 1D block_ids
-                        # Need to convert 2D cache_ids to 1D block_ids before sending
-                        if self.enable_head_wise_kv_cache and task.is_head_wise:
-                            # Convert 2D cache_ids to 1D block_ids for disaggregate
-                            cache_ids_2d = block_tables
-                            if cache_ids_2d and len(cache_ids_2d) > 0:
-                                block_ids_1d = [cache_id // self.kv_num_heads for cache_id in cache_ids_2d[0]]
-                                task.disaggregate_info["block_tables"] = block_ids_1d
-                                llm_logger.info(
-                                    f"[HEAD_WISE] Converted 2D cache_ids to 1D block_ids for disaggregate. "
-                                    f"request_id={task.request_id}, block_ids[:5]={block_ids_1d[:5]}"
-                                )
-                            else:
-                                task.disaggregate_info["block_tables"] = block_tables
-                        else:
-                            task.disaggregate_info["block_tables"] = block_tables
+                        if self.enable_head_wise_kv_cache:
+                            raise NotImplementedError(
+                                "Head-wise KV cache does not support PD disaggregation yet."
+                            )
+                        task.disaggregate_info["block_tables"] = block_tables
 
                         if task.disaggregate_info["role"] == "prefill":
                             self.req_dict[task.request_id] = allocated_position
@@ -376,16 +361,11 @@ class ResourceManager:
 
         # record batch size here
         if self.enable_head_wise_kv_cache:
-            # In head-wise mode, block_tables is 2D, count actual blocks
+            # In head-wise mode, block_tables is 2D: [kv_num_heads][num_blocks]
             num_blocks_used_by_tasks = 0
             for task in self.tasks_list:
                 if task and task.block_tables:
-                    # block_tables is 2D: [kv_num_heads][num_blocks]
-                    # count the number of blocks (second dimension)
-                    if task.is_head_wise and len(task.block_tables) > 0:
-                        num_blocks_used_by_tasks += len(task.block_tables[0])
-                    else:
-                        num_blocks_used_by_tasks += len(task.block_tables)
+                    num_blocks_used_by_tasks += len(task.block_tables[0]) if len(task.block_tables) > 0 else 0
         else:
             num_blocks_used_by_tasks = sum([len(task.block_tables) if task else 0 for task in self.tasks_list])
 
@@ -467,6 +447,8 @@ class ResourceManager:
         """
         num_total_gpu = self.total_block_number()
         num_free_gpu = len(self.cache_manager.gpu_free_block_list)
+        if self.enable_head_wise_kv_cache:
+            num_free_gpu = num_free_gpu // self.kv_num_heads
         if num_total_gpu > 0:
             return 1.0 - (num_free_gpu / num_total_gpu)
         return 0.0
